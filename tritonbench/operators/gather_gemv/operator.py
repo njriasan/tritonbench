@@ -38,7 +38,7 @@ class Operator(BenchmarkOperator):
     ):
         super().__init__(tb_args, extra_args)
 
-    @register_benchmark(baseline=True)
+    @register_benchmark()
     def test_0(self, p1, p2, p3) -> Callable:
         return lambda: triton_test_0(p1, p2, p3)
 
