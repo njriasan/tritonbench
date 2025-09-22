@@ -28,11 +28,11 @@ import psutil
 import tabulate
 import torch
 import triton
-from torch.utils._pytree import tree_flatten, tree_map
 
 from tritonbench.components.do_bench import do_bench_wrapper, Latency
 from tritonbench.components.export import export_data
 
+from tritonbench.components.power.chart import power_chart_begin, power_chart_end
 from tritonbench.utils.constants import (
     DEFAULT_QUANTILES,
     DEFAULT_REP,
@@ -873,6 +873,8 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     ) -> None:
         """Benchmarking the operator and returning its metrics."""
         metrics = []
+        if self.tb_args.power_chart:
+            power_chart_begin(self.benchmark_name, self.tb_args.power_chart)
         try:
             if "proton" in self.required_metrics:
                 import triton.profiler as proton
@@ -998,6 +1000,8 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 os._exit(1)
             raise
         finally:
+            if self.tb_args.power_chart:
+                power_chart_end()
             self.output = BenchmarkOperatorResult(
                 benchmark_name=self.tb_args.benchmark_name,
                 op_name=self.name,
