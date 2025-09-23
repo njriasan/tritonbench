@@ -27,6 +27,7 @@ def _host_descriptor_pre_hook(nargs):
     nargs["Out"].block_shape = [BLOCK_M_SPLIT, BLOCK_D]
 
 
+# Pick one configuration if ENABLE_PROTON.
 def get_cuda_autotune_config():
     return [
         triton.Config(
@@ -294,6 +295,10 @@ def gdpa_kernel_tma_ws_blackwell(
     SUBTILING: tl.constexpr,
     PINGPONG: tl.constexpr,
     ACT_REGS: tl.constexpr,
+    NAME_BARRIER: tl.constexpr,
+    MERGE_EPI: tl.constexpr,
+    ENABLE_PROTON: tl.constexpr,
+    PROTON_TILE: tl.constexpr,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -339,6 +344,8 @@ def gdpa_kernel_tma_ws_blackwell(
 
     # allocate buffers for k, v
     kv_buf = tlx.local_alloc((BLOCK_N, BLOCK_D), dtype, NUM_BUFFERS_KV)  # k
+    o0_smem = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), dtype, 1)
+    o1_smem = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), dtype, 1)
 
     # allocate tmem for outputs of 4 dots (after partitioning)
     # qk0 = q0 dot k, qk1 = q1 dot k, acc0 = p0 dot v, acc1 = p1 dot v
@@ -387,13 +394,17 @@ def gdpa_kernel_tma_ws_blackwell(
     producer_commit_o0 = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_O, arrive_count=1)
     producer_o1 = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_O, arrive_count=1)
     producer_commit_o1 = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_O, arrive_count=1)
+    producer_pp = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_O, arrive_count=1)
+    producer_commit_pp = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_O, arrive_count=1)
 
     with tlx.async_tasks():
         # activation calculation
         with tlx.async_task("default", registers=ACT_REGS):
             accum_cnt = 0
             accum_cnt_outer = 0
-            for _ in range(0, tiles_per_sm):
+            for idx in range(0, tiles_per_sm):
+                if ENABLE_PROTON and idx == PROTON_TILE:
+                    pl.enter_scope("ele0_tile")
                 begin_q, end_q, begin_k, qlen, klen = _compute_qlen(
                     tile_idx,
                     n_tile_num,
@@ -421,9 +432,15 @@ def gdpa_kernel_tma_ws_blackwell(
                         consumer_qk_view = tlx.local_view(producer_commit_qk0, bufIdx)
                         # tl.device_print("default producer_commit_qk0", accum_cnt)
                         # tl.device_print("default producer_commit_qk0_phase", phase)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("consumer_qk_view")
                         tlx.barrier_wait(consumer_qk_view, phase)
 
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("consumer_qk_view")
                         # qk_view: BLOCK_M // 2, HEAD_DIM
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("elementwise_0")
                         qk_view_1st = tlx.subslice(qk_view, 0, HEAD_DIM // 2)
                         qk0 = tlx.local_load(qk_view_1st)
                         qk_view_2nd = tlx.subslice(
@@ -438,10 +455,17 @@ def gdpa_kernel_tma_ws_blackwell(
                         square = _mul_f32x2(qk1, qk1)
                         inner = _fma_f32x2(c1, square, c0)
                         inner1 = _mul_f32x2(inner, qk1)
-
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("elementwise_0")
                         if PINGPONG:
-                            tlx.named_barrier_wait(9, 128)
+                            if NAME_BARRIER:
+                                tlx.named_barrier_wait(9, 128)
+                            else:
+                                # assume NUM_BUFFERS_QK is 1
+                                tlx.barrier_wait(producer_pp[0], phase ^ 1)  # acquire
                         # p0 = fast_gelu(qk0)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("tanh")
                         p0 = _fma_f32x2(qk0, tanh_approx_fp32(inner0), qk0)
                         p0 = p0.to(dtype)
                         p0_view = tlx.local_view(p0_buf, bufIdx)
@@ -459,9 +483,13 @@ def gdpa_kernel_tma_ws_blackwell(
                         # p and qk reuse tmem space, single producer commit for p via consumer_release_qk
                         consumer_release_qk_view = tlx.local_view(producer_qk0, bufIdx)
                         tlx.barrier_arrive(consumer_release_qk_view, 1)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("tanh")
                         if PINGPONG:
-                            tlx.named_barrier_arrive(10, 128)
-
+                            if NAME_BARRIER:
+                                tlx.named_barrier_arrive(10, 128)
+                            else:
+                                tlx.barrier_arrive(producer_commit_pp[0], 1)
                         # wait for o0, o1 per iteration
                         bufIdx = accum_cnt % NUM_BUFFERS_O
                         phase = (accum_cnt // NUM_BUFFERS_O) & 1
@@ -474,6 +502,8 @@ def gdpa_kernel_tma_ws_blackwell(
                         accum_cnt += 1
 
                     # epilogue here, load from tmem
+                    if ENABLE_PROTON and idx == PROTON_TILE:
+                        pl.enter_scope("elementwise_0_epi")
                     # FIXME: wait till o0 is done for the inner loop
                     bufIdx_o_outer, phase_o_outer = _get_bufidx_phase(
                         accum_cnt_outer, NUM_BUFFERS_O
@@ -486,7 +516,7 @@ def gdpa_kernel_tma_ws_blackwell(
                     )
                     # tl.device_print("default producer_o0", accum_cnt_outer)
                     tlx.barrier_arrive(consumer_release_o0_view, 1)
-                    if USE_ON_DEVICE_TMA:
+                    if USE_ON_DEVICE_TMA and MERGE_EPI:
                         o_desc = tl.make_tensor_descriptor(
                             Out,
                             shape=[end_q.to(tl.int32), HEAD_DIM * H],
@@ -497,22 +527,32 @@ def gdpa_kernel_tma_ws_blackwell(
                         o0 = o0.to(Out.type.element_ty)
                     else:
                         o0 = o0.to(tlx.dtype_of(o_desc))
-                    o_desc.store(
-                        [
-                            (begin_q + start_m * BLOCK_M).to(tl.int32),
-                            (out_offset).to(tl.int32),
-                        ],
-                        o0,
-                    )
+                    if MERGE_EPI:
+                        o_desc.store(
+                            [
+                                (begin_q + start_m * BLOCK_M).to(tl.int32),
+                                (out_offset).to(tl.int32),
+                            ],
+                            o0,
+                        )
+                    else:
+                        tlx.local_store(o0_smem[0], o0)
                     accum_cnt_outer += 1
+                    if ENABLE_PROTON and idx == PROTON_TILE:
+                        pl.exit_scope("elementwise_0_epi")
                 tile_idx += num_progs
+                if ENABLE_PROTON and idx == PROTON_TILE:
+                    pl.exit_scope("ele0_tile")
 
         with tlx.async_task(num_warps=4, registers=ACT_REGS):
             accum_cnt = 0
             accum_cnt_outer = 0
             if PINGPONG:
-                tlx.named_barrier_arrive(9, 128)
-            for _ in range(0, tiles_per_sm):
+                if NAME_BARRIER:
+                    tlx.named_barrier_arrive(9, 128)
+            for idx in range(0, tiles_per_sm):
+                if ENABLE_PROTON and idx == PROTON_TILE:
+                    pl.enter_scope("ele1_tile")
                 pid = tile_idx % n_tile_num
                 start_m = pid
                 off_hz = tile_idx // n_tile_num
@@ -537,9 +577,15 @@ def gdpa_kernel_tma_ws_blackwell(
                         phase = (accum_cnt // NUM_BUFFERS_QK) & 1
                         qk_view = tlx.local_view(qk1_buf, bufIdx)
                         consumer_qk_view = tlx.local_view(producer_commit_qk1, bufIdx)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("consumer_qk_view")
                         tlx.barrier_wait(consumer_qk_view, phase)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("consumer_qk_view")
 
                         # qk_view: BLOCK_M // 2, HEAD_DIM
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("elementwise_1")
                         qk_view_1st = tlx.subslice(qk_view, 0, HEAD_DIM // 2)
                         qk0 = tlx.local_load(qk_view_1st)
                         qk_view_2nd = tlx.subslice(
@@ -555,9 +601,18 @@ def gdpa_kernel_tma_ws_blackwell(
                         inner = _fma_f32x2(c1, square, c0)
                         inner1 = _mul_f32x2(inner, qk1)
 
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("elementwise_1")
                         if PINGPONG:
-                            tlx.named_barrier_wait(10, 128)
+                            if NAME_BARRIER:
+                                tlx.named_barrier_wait(10, 128)
+                            else:
+                                tlx.barrier_wait(
+                                    producer_commit_pp[0], phase
+                                )  # consumer_wait
                         # p0 = fast_gelu(qk0)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("tanh")
                         p0 = _fma_f32x2(qk0, tanh_approx_fp32(inner0), qk0)
                         p0 = p0.to(dtype)
                         p1_view = tlx.local_view(p1_buf, bufIdx)
@@ -575,8 +630,13 @@ def gdpa_kernel_tma_ws_blackwell(
                         # p and qk reuse tmem space, single producer commit for p via consumer_release_qk
                         consumer_release_qk_view = tlx.local_view(producer_qk1, bufIdx)
                         tlx.barrier_arrive(consumer_release_qk_view, 1)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("tanh")
                         if PINGPONG:
-                            tlx.named_barrier_arrive(9, 128)
+                            if NAME_BARRIER:
+                                tlx.named_barrier_arrive(9, 128)
+                            else:
+                                tlx.barrier_arrive(producer_pp[0], 1)
 
                         # wait for o0, o1 per iteration
                         bufIdx = accum_cnt % NUM_BUFFERS_O
@@ -586,12 +646,14 @@ def gdpa_kernel_tma_ws_blackwell(
                         # there is no need to wait for o1 at each iteration
                         # tlx.barrier_wait(consumer_o1_view, phase)
                         accum_cnt += 1
+                    if ENABLE_PROTON and idx == PROTON_TILE:
+                        pl.enter_scope("elementwise_1_epi")
                     # epilogue here, load from tmem
                     # FIXME: wait till o1 is done for the inner loop
                     bufIdx_o_outer, phase_o_outer = _get_bufidx_phase(
                         accum_cnt_outer, NUM_BUFFERS_O
                     )
-                    if USE_ON_DEVICE_TMA:
+                    if USE_ON_DEVICE_TMA and MERGE_EPI:
                         o_desc = tl.make_tensor_descriptor(
                             Out,
                             shape=[end_q.to(tl.int32), HEAD_DIM * H],
@@ -609,15 +671,24 @@ def gdpa_kernel_tma_ws_blackwell(
                         o1 = o1.to(Out.type.element_ty)
                     else:
                         o1 = o1.to(tlx.dtype_of(o_desc))
-                    o_desc.store(
-                        [
-                            (begin_q + start_m * BLOCK_M + BLOCK_M // 2).to(tl.int32),
-                            (out_offset).to(tl.int32),
-                        ],
-                        o1,
-                    )
+                    if MERGE_EPI:
+                        o_desc.store(
+                            [
+                                (begin_q + start_m * BLOCK_M + BLOCK_M // 2).to(
+                                    tl.int32
+                                ),
+                                (out_offset).to(tl.int32),
+                            ],
+                            o1,
+                        )
+                    else:
+                        tlx.local_store(o1_smem[0], o1)
                     accum_cnt_outer += 1
+                    if ENABLE_PROTON and idx == PROTON_TILE:
+                        pl.exit_scope("elementwise_1_epi")
                 tile_idx += num_progs
+                if ENABLE_PROTON and idx == PROTON_TILE:
+                    pl.exit_scope("ele1_tile")
 
         with tlx.async_task(num_warps=1, registers=24):  # gemm
             accum_cnt_q = 0
@@ -625,7 +696,9 @@ def gdpa_kernel_tma_ws_blackwell(
             accum_cnt_o = 0
             accum_cnt_qk = 0
             accum_cnt_outer = 0
-            for _ in range(0, tiles_per_sm):
+            for idx in range(0, tiles_per_sm):
+                if ENABLE_PROTON and idx == PROTON_TILE:
+                    pl.enter_scope("dot_tile")
                 pid = tile_idx % n_tile_num
                 start_m = pid
                 begin_q, end_q, begin_k, qlen, klen = _compute_qlen(
@@ -735,9 +808,13 @@ def gdpa_kernel_tma_ws_blackwell(
                     # tl.device_print("gemm producer_qk0", accum_cnt_qk)
                     # tl.device_print("gemm producer_qk0_phase", phase_p)
                     # DEBUG_PERF_P
+                    if ENABLE_PROTON and idx == PROTON_TILE:
+                        pl.enter_scope("dot_wait_p0")
                     tlx.barrier_wait(
                         consumer_p0_view, phase_p
                     )  # consumer wait for p0 due to reuse of p0 and qk0
+                    if ENABLE_PROTON and idx == PROTON_TILE:
+                        pl.exit_scope("dot_wait_p0")
                     # reinterpret qk0 as p0
                     p0_view = tlx.local_view(p0_buf, bufIdx_p)
 
@@ -809,9 +886,13 @@ def gdpa_kernel_tma_ws_blackwell(
                         # tl.device_print("gemm producer_qk1", accum_cnt_qk1)
                         # tl.device_print("gemm producer_qk1_phase", phase_qk1)
                         # DEBUG_PERF_P
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("dot_wait_p1")
                         tlx.barrier_wait(
                             consumer_p1_view, phase_qk1
                         )  # consumer wait for p1 use producer_qk1 due to reuse
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("dot_wait_p1")
                         # done using v from previous iteration
                         bufIdx_o1, phase_o1 = _get_bufidx_phase(
                             accum_cnt_o1,
@@ -884,9 +965,13 @@ def gdpa_kernel_tma_ws_blackwell(
                         # tl.device_print("gemm producer_qk0", accum_cnt_qk)
                         # tl.device_print("gemm producer_qk0_phase", phase_qk)
                         # DEBUG_PERF_P
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("dot_wait_p0")
                         tlx.barrier_wait(
                             consumer_p0_view, phase_qk
                         )  # consumer wait for p0 use producer_qk0 due to reuse
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("dot_wait_p0")
 
                         v_view = tlx.local_view(kv_buf, bufIdx_v)
                         bufIdx_o, phase_o = _get_bufidx_phase(
@@ -969,6 +1054,8 @@ def gdpa_kernel_tma_ws_blackwell(
                     # signal producer commit of epi0 and epi1, we don't want to block the gemm partition
                     # to wait for the completion
                 tile_idx += num_progs
+                if ENABLE_PROTON and idx == PROTON_TILE:
+                    pl.exit_scope("dot_tile")
 
         with tlx.async_task(num_warps=1, registers=24):  # load
             accum_count_q = 0
@@ -1115,7 +1202,11 @@ def gdpa_kernel_tma_ws_blackwell(
                         # tl.device_print("load consumer_release_k", accum_cnt_kv)
                         # tl.device_print("load consumer_release_k_buf", k_bufIdx)
                         # tl.device_print("load consumer_release_k_phase", k_phase)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("load_wait_k_empty")
                         tlx.barrier_wait(k_empty_view, k_phase)  # ^ 1)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("load_wait_k_empty")
                         # barrier for producer commit
                         k_full_view = tlx.local_view(consumer_kv, k_bufIdx)
                         tlx.barrier_expect_bytes(
@@ -1143,7 +1234,11 @@ def gdpa_kernel_tma_ws_blackwell(
                         # tl.device_print("load accum_cnt_kv", accum_cnt_kv + 1)
                         # tl.device_print("load consumer_release_v_buf", v_bufIdx)
                         # tl.device_print("load consumer_release_v_phase", v_phase)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.enter_scope("load_wait_v_empty")
                         tlx.barrier_wait(v_empty_view, v_phase)  # ^ 1)
+                        if ENABLE_PROTON and idx == PROTON_TILE:
+                            pl.exit_scope("load_wait_v_empty")
                         # barrier for producer commit
                         v_full_view = tlx.local_view(consumer_kv, v_bufIdx)
                         tlx.barrier_expect_bytes(v_full_view, BLOCK_N * BLOCK_D * 2)
@@ -1161,6 +1256,55 @@ def gdpa_kernel_tma_ws_blackwell(
                         accum_cnt_kv += 2
                     # outside of inner for
                     accum_count_q += 1
+                tile_idx += num_progs
+        with tlx.async_task(num_warps=1, registers=24):  # epilogue
+            # Can we guard this with not MERGE_EPI?
+            accum_cnt_outer = 0
+            for idx in range(0, tiles_per_sm):
+                pid = tile_idx % n_tile_num
+                start_m = pid
+                off_hz = tile_idx // n_tile_num
+                off_h = off_hz % H
+                out_offset = off_h.to(tl.int64) * stride_oh
+
+                begin_q, end_q, begin_k, qlen, klen = _compute_qlen(
+                    tile_idx,
+                    n_tile_num,
+                    Q_offsets,
+                    K_offsets,
+                    seq_index,
+                    SORT_BY_SEQ_LENGTH,
+                    H,
+                    N_CTX,
+                )
+
+                if start_m * BLOCK_M < qlen:
+                    out_offset = off_h.to(tl.int64) * stride_oh
+                    if USE_ON_DEVICE_TMA:
+                        o_desc = tl.make_tensor_descriptor(
+                            Out,
+                            shape=[end_q.to(tl.int32), HEAD_DIM * H],
+                            strides=[HEAD_DIM * H, 1],
+                            block_shape=[BLOCK_M // 2, BLOCK_D],
+                        )
+                    # wait for o0
+                    tlx.async_descriptor_store(
+                        o_desc,
+                        o0_smem[0],
+                        [
+                            (begin_q + start_m * BLOCK_M).to(tl.int32),
+                            (out_offset).to(tl.int32),
+                        ],
+                    )
+                    tlx.async_descriptor_store(
+                        o_desc,
+                        o1_smem[0],
+                        [
+                            (begin_q + start_m * BLOCK_M + BLOCK_M // 2).to(tl.int32),
+                            (out_offset).to(tl.int32),
+                        ],
+                    )
+                    accum_cnt_outer += 1
                 tile_idx += num_progs
 
 
@@ -1324,6 +1468,8 @@ def gdpa_forward_tlx(
     # print(query_offset)
     # print(key_offset)
 
+    enable_proton = True if os.getenv("ENABLE_PROTON") == "1" else False
+
     gdpa_kernel_tma_ws_blackwell[grid_tma_persistent](
         q if USE_ON_DEVICE_TMA else desc_q,
         query_offset,
@@ -1366,6 +1512,10 @@ def gdpa_forward_tlx(
         IS_DENSE_KV=is_dense_kv,
         activation_enum_int=activation_enum_int,
         USE_ON_DEVICE_TMA=USE_ON_DEVICE_TMA,
+        NAME_BARRIER=False,
+        MERGE_EPI=False,
+        ENABLE_PROTON=enable_proton,
+        PROTON_TILE=10,
         **extra_kern_args,
     )
     return o
