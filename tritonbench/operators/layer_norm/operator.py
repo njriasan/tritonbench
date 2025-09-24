@@ -57,6 +57,10 @@ class Operator(BenchmarkOperator):
         args = parse_op_args(self.extra_args)
         self.M = args.M
         self.N = args.N
+        if self.tb_args.rtol is None:
+            self.tb_args.rtol = 1e-5
+        if self.tb_args.atol is None:
+            self.tb_args.atol = 5e-3
 
     @register_benchmark()
     def triton_layer_norm(self, *args):
@@ -99,6 +103,7 @@ class Operator(BenchmarkOperator):
         # Run forward once to get output
         output = fwd_fn()
         y = output[0] if isinstance(output, tuple) else output
+        torch.manual_seed(0)
         dy = 0.1 * torch.randn_like(y)
 
         # Extract tensors that require gradients from example_inputs

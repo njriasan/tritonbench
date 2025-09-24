@@ -1209,12 +1209,51 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     def logging_group(self) -> Optional[str]:
         return self.tb_args.logging_group
 
-    def _check_gradients(self, grad_tensors, baseline_grad_tensors, mode=""):
+    def _clone_gradients(self, tensors, mode="") -> List[Optional[torch.Tensor]]:
+        """Clone gradients from the provided tensors.
+
+        Args:
+            tensors: List/tuple of tensors (each should have `.grad` possibly populated)
+            mode: Optional mode information for better error messages
+
+        Returns:
+            List of cloned gradients (or None when no gradient was produced).
+        """
+
+        assert isinstance(tensors, (list, tuple)), (
+            f"{mode}: Backward function must return a list/tuple of tensors"
+            if mode
+            else "Backward function must return a list/tuple of tensors"
+        )
+
+        grads: List[Optional[torch.Tensor]] = []
+        for idx, tensor in enumerate(tensors):
+            if tensor is None:
+                grads.append(None)
+                continue
+
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"{mode}: Expected tensor in backward results at index {idx}, "
+                    f"got {type(tensor)}"
+                    if mode
+                    else (
+                        "Expected tensor in backward results but received "
+                        f"{type(tensor)}"
+                    )
+                )
+
+            grad = tensor.grad
+            grads.append(grad.detach().clone() if grad is not None else None)
+
+        return grads
+
+    def _check_gradients(self, grads, baseline_grads, mode=""):
         """Helper to check gradients between two sets of tensors.
 
         Args:
-            grad_tensors: List of tensors with gradients from implementation
-            baseline_grad_tensors: List of tensors with gradients from baseline
+            grads: List of gradient tensors (or None) from implementation
+            baseline_grads: List of gradient tensors (or None) from baseline
             mode: Mode name for error messages (e.g. "BWD" or "FWD_BWD")
 
         Returns:
@@ -1223,37 +1262,37 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         prefix = f"{mode}: " if mode else ""
 
         # Ensure we have tensors to check
-        assert len(grad_tensors) > 0, (
+        assert len(grads) > 0, (
             f"{prefix}No tensors with requires_grad=True found. "
             "Check that input tensors have requires_grad set."
         )
 
         # Ensure same number of grad tensors
-        assert len(grad_tensors) == len(baseline_grad_tensors), (
-            f"{prefix}Mismatch in number of grad tensors: {len(grad_tensors)} vs "
-            f"{len(baseline_grad_tensors)}"
+        assert len(grads) == len(baseline_grads), (
+            f"{prefix}Mismatch in number of grad tensors: {len(grads)} vs "
+            f"{len(baseline_grads)}"
         )
 
         # Compare each tensor's gradient
         has_gradient = False
-        for i, (t, bt) in enumerate(zip(grad_tensors, baseline_grad_tensors)):
+        for i, (grad, baseline_grad) in enumerate(zip(grads, baseline_grads)):
             # Check gradient existence
-            if (t.grad is None) != (bt.grad is None):
+            if (grad is None) != (baseline_grad is None):
                 print(
                     f"{prefix}Gradient existence mismatch for tensor {i}: "
-                    f"impl has grad={t.grad is not None}, "
-                    f"baseline has grad={bt.grad is not None}"
+                    f"impl has grad={grad is not None}, "
+                    f"baseline has grad={baseline_grad is not None}"
                 )
                 return False
 
-            if t.grad is not None:
+            if grad is not None:
                 has_gradient = True
                 torch.testing.assert_close(
-                    t.grad,
-                    bt.grad,
+                    grad,
+                    baseline_grad,
                     rtol=self.tb_args.rtol,
                     atol=self.tb_args.atol,
-                    msg=f"{prefix}Gradient mismatch for tensor {i} with shape {t.shape}",
+                    msg=f"{prefix}Gradient mismatch for tensor {i} with shape {grad.shape}",
                 )
 
         # Ensure at least one tensor has a gradient
@@ -1278,21 +1317,31 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             elif self.mode == Mode.BWD:
                 # Get tensors with gradients from both implementations
                 grad_tensors = fn()
+                # Clone gradients to maintain an isolated copy of the result for later comparison
+                impl_grads = self._clone_gradients(grad_tensors, mode="BWD")
+
                 baseline_grad_tensors = baseline_fn()
+                baseline_grads = self._clone_gradients(
+                    baseline_grad_tensors, mode="BWD"
+                )
                 # Use helper to check gradients
-                if not self._check_gradients(
-                    grad_tensors, baseline_grad_tensors, "BWD"
-                ):
+                if not self._check_gradients(impl_grads, baseline_grads, "BWD"):
                     return False
             elif self.mode == Mode.FWD_BWD:
                 # FWD_BWD should return (forward_output, grad_tensors) tuple
                 output = fn()
-                baseline_output = baseline_fn()
 
                 # Unpack the results - expecting (fwd_output, grad_tensors)
                 if isinstance(output, tuple) and len(output) == 2:
                     fwd_output, grad_tensors = output
+                    # Clone gradients to maintain an isolated copy of the result for later comparison
+                    impl_grads = self._clone_gradients(grad_tensors, mode="FWD_BWD")
+
+                    baseline_output = baseline_fn()
                     baseline_fwd_output, baseline_grad_tensors = baseline_output
+                    baseline_grads = self._clone_gradients(
+                        baseline_grad_tensors, mode="FWD_BWD"
+                    )
 
                     # Check forward outputs match
                     torch.testing.assert_close(
@@ -1303,9 +1352,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     )
 
                     # Check backward gradients using helper
-                    if not self._check_gradients(
-                        grad_tensors, baseline_grad_tensors, "FWD_BWD"
-                    ):
+                    if not self._check_gradients(impl_grads, baseline_grads, "FWD_BWD"):
                         return False
                 else:
                     # FWD_BWD mode requires specific return format
