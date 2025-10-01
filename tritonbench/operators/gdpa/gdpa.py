@@ -27,8 +27,6 @@ import triton.language as tl  # @manual=//triton:triton
 from torch._library.triton import capture_triton
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from .gdpa_blackwell_tlx import gdpa_backward_tlx, get_tlx_bwd_autotune_config
-
 from .gdpa_utils import (
     custom_triton_op,
     get_autotune_kernel,
@@ -47,6 +45,8 @@ from .math import (
 try:
     # @manual=//triton:triton
     import triton.language.extra.tlx as tlx  # type: ignore
+
+    from .gdpa_blackwell_tlx import gdpa_backward_tlx, get_tlx_bwd_autotune_config
 
     HAS_TLX = True
 except ImportError:
@@ -1082,9 +1082,10 @@ bwd_autotune_configs_ws = {
     "default": tuple(bwd_configs_ws),
 }
 
-bwd_autotune_configs_tlx = {
-    "default": tuple(get_tlx_bwd_autotune_config()),
-}
+if HAS_TLX:
+    bwd_autotune_configs_tlx = {
+        "default": tuple(get_tlx_bwd_autotune_config()),
+    }
 
 
 @lru_cache
