@@ -108,17 +108,18 @@ class Operator(BenchmarkOperator):
     # TODO: Does not work on hip
     @register_benchmark(enabled=is_cuda())
     def preprocessed_pt2_triton_grouped_mm(self, group_A, group_B):
-        def _inner():
-            torch._dynamo.reset()
+        torch._dynamo.reset()
 
-            with inductor_config.patch(
-                max_autotune=True,
-                max_autotune_gemm_backends="TRITON",
-                autotune_fallback_to_aten=False,
-            ):
-                A_packed, B_shared, offs = self.list_input_to_jagged(group_A, group_B)
-                compiled = torch.compile(torch._grouped_mm, dynamic=False)
-                return compiled(A_packed, B_shared, offs=offs, bias=None)
+        with inductor_config.patch(
+            max_autotune=True,
+            max_autotune_gemm_backends="TRITON",
+            autotune_fallback_to_aten=False,
+        ):
+            A_packed, B_shared, offs = self.list_input_to_jagged(group_A, group_B)
+            compiled = torch.compile(torch._grouped_mm, dynamic=False)
+
+        def _inner():
+            return compiled(A_packed, B_shared, offs=offs, bias=None)
 
         return _inner
 
