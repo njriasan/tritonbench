@@ -291,7 +291,7 @@ else:
     configs = [
         make_standard_config(BM, BN, s, w, subtile, vectmul, add2reduce)
         for BM in [256]
-        for BN in [128]
+        for BN in [64, 128]
         for s in NUM_STAGES_OPTIONS
         for w in [4]
         for subtile in [True]
@@ -316,6 +316,13 @@ def prune_invalid_configs(configs, named_args, **kwargs):
 
     # Filter out configs where BLOCK_M > N_CTX
     return [conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX]
+
+
+def prune_persistent_configs(configs, named_args, **kwargs):
+    N_CTX = kwargs["N_CTX"]
+    # Filter out configs based on desired BLOCK_n
+    TARGET_BLOCK_N = 64 if N_CTX == 128 else 128
+    return [conf for conf in configs if conf.kwargs.get("BLOCK_N", 0) == TARGET_BLOCK_N]
 
 
 @triton.jit
@@ -399,7 +406,7 @@ def _attn_fwd_tma_dp(
     desc_o,
     pid,
     off_hz,
-    N_CTX,  #
+    N_CTX: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
     BLOCK_M: tl.constexpr,  #
     BLOCK_N: tl.constexpr,  #
@@ -543,7 +550,7 @@ def _attn_fwd(
     desc_k,
     desc_v,
     desc_o,
-    N_CTX,  #
+    N_CTX: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
     BLOCK_M: tl.constexpr,  #
     BLOCK_N: tl.constexpr,  #
@@ -585,7 +592,7 @@ def _attn_fwd(
 @triton.autotune(
     configs=list(filter(keep, configs)),
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
-    prune_configs_by={"early_config_prune": prune_invalid_configs},
+    prune_configs_by={"early_config_prune": prune_persistent_configs},
 )
 @triton.jit
 def _attn_fwd_persist(
@@ -597,7 +604,7 @@ def _attn_fwd_persist(
     desc_k,
     desc_v,
     desc_o,
-    N_CTX,  #: tl.constexpr,  #
+    N_CTX: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
     BLOCK_M: tl.constexpr,  #
     BLOCK_N: tl.constexpr,  #
