@@ -259,7 +259,7 @@ else:
         if HAS_REG_AUTO_WS:
             extra_kwargs["minRegAutoWS"] = 24
             extra_kwargs["maxRegAutoWS"] = maxreg
-            # extra_kwargs["data_partition_factor"] = 2
+            extra_kwargs["data_partition_factor"] = 2
 
         return triton.Config(config_kwargs, **extra_kwargs)
 
@@ -556,7 +556,6 @@ def _attn_fwd_persist(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
-    data_partition_factor: tl.constexpr,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -595,12 +594,7 @@ def _attn_fwd_persist(
     )
 
     # inner loop warpspec vs. outer loop warpspec
-    for _ in tl.range(
-        0,
-        tiles_per_sm,
-        warp_specialize=warp_specialize and OUTER_LOOP,
-        data_partition_factor=data_partition_factor,
-    ):
+    for _ in tl.range(0, tiles_per_sm, warp_specialize=warp_specialize and OUTER_LOOP):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
         _attn_fwd_tma_dp(
