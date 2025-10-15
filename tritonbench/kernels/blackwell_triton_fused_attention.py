@@ -76,11 +76,8 @@ def _attn_fwd_subtile(
             qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
         else:
             qk = qk * qk_scale - m_ij[:, None]
-    p = tl.math.exp2(qk)
     # -- compute correction factor
     alpha = tl.math.exp2(m_i - m_ij)
-    if not FADD2_REDUCE:
-        l_ij = tl.sum(p, 1)
 
     # -- update output accumulator --
     BM: tl.constexpr = acc.shape[0]
@@ -98,6 +95,7 @@ def _attn_fwd_subtile(
     else:
         acc = acc * alpha[:, None]
 
+    p = tl.math.exp2(qk)
     PM: tl.constexpr = p.shape[0]
     PN: tl.constexpr = p.shape[1]
     if FADD2_REDUCE:
@@ -105,6 +103,8 @@ def _attn_fwd_subtile(
         l_ij0, l_ij1 = tl.reduce((p0, p1), axis=1, combine_fn=_reduce_fadd2)
         l_i0 = l_i0 * alpha + l_ij0
         l_i1 = l_i1 * alpha + l_ij1
+    else:
+        l_ij = tl.sum(p, 1)
 
     # prepare p and v for the dot
     p = p.to(dtype)
@@ -259,7 +259,7 @@ else:
         if HAS_REG_AUTO_WS:
             extra_kwargs["minRegAutoWS"] = 24
             extra_kwargs["maxRegAutoWS"] = maxreg
-            extra_kwargs["data_partition_factor"] = 2
+            # extra_kwargs["data_partition_factor"] = 2
 
         return triton.Config(config_kwargs, **extra_kwargs)
 
@@ -556,6 +556,7 @@ def _attn_fwd_persist(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    data_partition_factor: tl.constexpr,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -594,7 +595,12 @@ def _attn_fwd_persist(
     )
 
     # inner loop warpspec vs. outer loop warpspec
-    for _ in tl.range(0, tiles_per_sm, warp_specialize=warp_specialize and OUTER_LOOP):
+    for _ in tl.range(
+        0,
+        tiles_per_sm,
+        warp_specialize=warp_specialize and OUTER_LOOP,
+        data_partition_factor=data_partition_factor,
+    ):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
         _attn_fwd_tma_dp(
@@ -707,6 +713,7 @@ class _attention_opt(torch.autograd.Function):
                 warp_specialize=warp_specialize,
                 OUTER_LOOP=True,
                 dtype=torch_dtype_to_triton(q.dtype),
+                data_partition_factor=2,
                 **extra_kern_args,
             )
         else:
