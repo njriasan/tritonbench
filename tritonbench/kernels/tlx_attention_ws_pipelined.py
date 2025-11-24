@@ -43,6 +43,7 @@ configs = [
 ]
 
 configs_persistent = [
+    # H-DIM = 128 configs
     triton.Config(
         {
             "BLOCK_M": 256,
@@ -57,7 +58,28 @@ configs_persistent = [
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
+    # H-DIM = 64 configs
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 6,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
 ]
+
+
+def prune_pipelined_configs_by_hdim(configs, named_args, **kwargs):
+    HEAD_DIM = kwargs["HEAD_DIM"]
+    # Only match HEAD_DIM for BLOCK_N
+    return [conf for conf in configs if conf.kwargs.get("BLOCK_N", 0) == HEAD_DIM]
 
 
 @triton.jit
@@ -768,7 +790,9 @@ def _pipelined_softmax_inner_loop(
 
 
 @triton.autotune(
-    configs=configs_persistent, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"]
+    configs=configs_persistent,
+    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"],
+    prune_configs_by={"early_config_prune": prune_pipelined_configs_by_hdim},
 )
 @triton.jit
 def _attn_fwd_ws_persistent(
