@@ -1,13 +1,14 @@
 import tilelang
 import tilelang.language as T
 
+
 @tilelang.jit()
 def tilelang_nop_kernel():
-
     @T.prim_func
     def nop_kernel():
         with T.Kernel(1) as bx:
             pass
+
     return nop_kernel
 
 
@@ -37,4 +38,5 @@ def tilelang_nop_with_args_kernel():
     ):
         with T.Kernel(1) as bx:
             pass
+
     return nop_with_args_kernel

@@ -102,9 +102,9 @@ class EntropyCriterion:
         # Optimization: nlog(n) - olog(o) = nlog(1+(n-o)/o) + (n - o)log(o)
         if old_count > 0 and new_count > 0:
             delta = new_count - old_count
-            self._sum_count_log_count += (
-                new_count * math.log2(1 + delta / old_count) + delta * math.log2(old_count)
-            )
+            self._sum_count_log_count += new_count * math.log2(
+                1 + delta / old_count
+            ) + delta * math.log2(old_count)
         else:
             if old_count > 0:
                 self._sum_count_log_count -= old_count * math.log2(old_count)

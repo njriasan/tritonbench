@@ -3,19 +3,18 @@ from torch import zeros
 
 from torch._inductor.utils import triton_version_uses_attrs_dict
 from triton.compiler import CompiledKernel
-
-from tritonbench.utils.triton_op import (
-    BenchmarkOperator,
-    register_benchmark,
-)
 from tritonbench.utils.python_utils import try_import
+
+from tritonbench.utils.triton_op import BenchmarkOperator, register_benchmark
 
 with try_import("HAS_TILELANG"):
     import tilelang
+
     from .tilelang import tilelang_nop_kernel, tilelang_nop_with_args_kernel
 
 with try_import("HAS_CUTEDSL"):
     import cutlass.cute as cute
+
     from .cutedsl import cutedsl_nop_kernel, cutedsl_nop_with_args_kernel
 
 from .kernels import get_trivial_add_kernel, nop_kernel, nop_with_args_kernel

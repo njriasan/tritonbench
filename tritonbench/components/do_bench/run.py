@@ -546,7 +546,9 @@ def _do_bench_entropy(
         torch.cuda.synchronize()
 
         for i in range(batch_size):
-            v = round(batch_start_events[i].elapsed_time(batch_end_events[i]), rounding_factor)
+            v = round(
+                batch_start_events[i].elapsed_time(batch_end_events[i]), rounding_factor
+            )
             last_batch[i] = v
 
             entropy_criterion.add_measurement(v)
@@ -565,7 +567,7 @@ def _do_bench_entropy(
 
         if counter >= 200 and not precision_increase:
             stats = entropy_criterion.get_stats()
-            unique_count = stats.get('unique_measurements', 0)
+            unique_count = stats.get("unique_measurements", 0)
 
             # If we have < 20 unique values, this indicates quantization, increase rounding precision
             if unique_count < 20:
@@ -573,9 +575,10 @@ def _do_bench_entropy(
                 entropy_criterion.reset()
                 entropy_criterion.entropy_window_size = 1000
 
-                logger.info(f"Quantization detected: only {unique_count} unique measurements. ")
+                logger.info(
+                    f"Quantization detected: only {unique_count} unique measurements. "
+                )
                 precision_increase = True
-
 
     # Log if warmup didn't converge
     if not converged:

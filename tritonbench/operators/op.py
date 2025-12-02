@@ -43,9 +43,7 @@ def _list_opbench_paths() -> List[str]:
         )
         opbench.extend(o)
         opbench = [
-            op
-            for op in opbench
-            if not os.path.basename(op) == INTERNAL_OPBENCH_DIR
+            op for op in opbench if not os.path.basename(op) == INTERNAL_OPBENCH_DIR
         ]
     return opbench
 

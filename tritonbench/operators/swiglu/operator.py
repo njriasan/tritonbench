@@ -38,7 +38,9 @@ class Operator(BenchmarkOperator):
         )
         self.baseline_op = LlamaMLP(self.llama_config).to(self.device).to(self.dtype)
         if LigerSwiGLUMLP is not None:
-            self.liger_op = LigerSwiGLUMLP(self.llama_config).to(self.device).to(self.dtype)
+            self.liger_op = (
+                LigerSwiGLUMLP(self.llama_config).to(self.device).to(self.dtype)
+            )
             # Copy weights from baseline to liger model for fair accuracy comparison
             with torch.no_grad():
                 self.liger_op.gate_proj.weight.data.copy_(

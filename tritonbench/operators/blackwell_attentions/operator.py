@@ -103,7 +103,7 @@ except ImportError:
 
 if HAS_TLX:
     from tritonbench.kernels.tlx_attention_ws_pipelined import (
-        attention as tlx_blackwell_fwd,
+        attention as tlx_blackwell,
     )
 
 
@@ -543,17 +543,17 @@ class Operator(BenchmarkOperator):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> Callable:
-        return lambda: tlx_blackwell_fwd(q, k, v, self.causal, self.sm_scale, False)
+        return lambda: tlx_blackwell(q, k, v, self.causal, self.sm_scale, False)
 
-    # Only works with triton beta, forward only.
+    # Only works with triton beta.
     @register_benchmark(enabled=HAS_TLX)
-    def tlx_blackwell_ws_pipelined_persistent_fwd(
+    def tlx_blackwell_ws_pipelined_persistent(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> Callable:
-        return lambda: tlx_blackwell_fwd(q, k, v, self.causal, self.sm_scale, True)
+        return lambda: tlx_blackwell(q, k, v, self.causal, self.sm_scale, True)
 
     @register_metric(x_only=True)
     def flops(
@@ -636,4 +636,8 @@ class Operator(BenchmarkOperator):
             base_info += f" Local {self.window_size[0]},{self.window_size[1]}"
         if self.causal:
             base_info += " Causal"
+        if self.mode in (BenchmarkMode.FWD, BenchmarkMode.FWD_NO_GRAD):
+            base_info += f" {BenchmarkMode.FWD.value}"
+        else:
+            base_info += f" {self.mode.value}"
         return base_info

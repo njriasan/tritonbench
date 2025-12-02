@@ -46,6 +46,7 @@ class TorchLMHeadCE(torch.nn.Module):
 
 
 if LigerFusedLinearCrossEntropyLoss is not None:
+
     class LigerLMHeadCE(torch.nn.Module):
         def __init__(self, ignore_index: int = -100):
             super().__init__()
