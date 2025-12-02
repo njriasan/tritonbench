@@ -43,7 +43,7 @@ configs = [
 ]
 
 configs_persistent = [
-    # H-DIM = 128 configs
+    # H-DIM = 128 configs, non-causal
     triton.Config(
         {
             "BLOCK_M": 256,
@@ -53,12 +53,29 @@ configs_persistent = [
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
         },
         num_stages=0,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
-    # H-DIM = 64 configs
+    # H-DIM = 128 configs, causal
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 4,
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
+    # H-DIM = 64 configs, non-causal
     triton.Config(
         {
             "BLOCK_M": 256,
@@ -68,6 +85,23 @@ configs_persistent = [
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
+    # H-DIM = 64 configs, causal
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 6,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 4,
         },
         num_stages=0,
         num_warps=4,
@@ -78,9 +112,15 @@ configs_persistent = [
 
 def prune_pipelined_configs_by_hdim(configs, named_args, **kwargs):
     HEAD_DIM = kwargs["HEAD_DIM"]
+    STAGE = kwargs["STAGE"]
     target_kv_buffers = 6 if HEAD_DIM == 64 else 3
-    # Only match HEAD_DIM for BLOCK_N
-    return [conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers]
+    target_group_size_n = 4 if STAGE == 3 else 1
+    return [
+        conf
+        for conf in configs
+        if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
+        and conf.kwargs.get("GROUP_SIZE_N", 0) == target_group_size_n
+    ]
 
 
 @triton.jit
@@ -690,9 +730,21 @@ def _attn_fwd_ws(
 
 
 @triton.jit
-def _compute_offsets_persistent(tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE):
-    start_m = tile_idx % n_tile_num
-    off_hz = tile_idx // n_tile_num
+def _compute_offsets_persistent(
+    tile_idx,
+    H,
+    num_pid_n,
+    num_pid_in_group,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    STAGE: tl.constexpr,
+    GROUP_SIZE_N: tl.constexpr,
+):
+    group_id = tile_idx // num_pid_in_group
+    first_pid_n = group_id * GROUP_SIZE_N
+    group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
+    start_m = (tile_idx % num_pid_in_group) // group_size_n
+    off_hz = first_pid_n + (tile_idx % group_size_n)
     off_z = off_hz // H
     off_h = off_hz % H
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
@@ -816,6 +868,7 @@ def _attn_fwd_ws_persistent(
     NUM_BUFFERS_QK: tl.constexpr,  #
     NUM_MMA_GROUPS: tl.constexpr,  #
     NUM_MMA_SLICES: tl.constexpr,  #
+    GROUP_SIZE_N: tl.constexpr,  #
 ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -826,10 +879,13 @@ def _attn_fwd_ws_persistent(
     # original grid
     #   triton.cdiv(q.shape[2], META["BLOCK_M"]),
     #   q.shape[0] * q.shape[1],
-    n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
-    total_tiles = n_tile_num * Z * H
+    num_pid_m = tl.cdiv(N_CTX, BLOCK_M)
+    num_pid_n = Z * H
+    num_pid_in_group = num_pid_m * GROUP_SIZE_N
+
+    total_tiles = num_pid_m * num_pid_n
 
     tiles_per_sm = total_tiles // num_progs
     if prog_id < total_tiles % num_progs:
@@ -920,7 +976,14 @@ def _attn_fwd_ws_persistent(
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = (
                     _compute_offsets_persistent(
-                        tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE
+                        tile_idx,
+                        H,
+                        num_pid_n,
+                        num_pid_in_group,
+                        N_CTX,
+                        BLOCK_M,
+                        STAGE,
+                        GROUP_SIZE_N,
                     )
                 )
                 for _ in tl.range(lo, hi, BLOCK_N):
@@ -991,7 +1054,14 @@ def _attn_fwd_ws_persistent(
                 # initialize offsets
                 start_m, off_hz, _, _, qo_offset_y, kv_offset_y = (
                     _compute_offsets_persistent(
-                        tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE
+                        tile_idx,
+                        H,
+                        num_pid_n,
+                        num_pid_in_group,
+                        N_CTX,
+                        BLOCK_M,
+                        STAGE,
+                        GROUP_SIZE_N,
                     )
                 )
                 # initialize pointer to m and l
@@ -1074,7 +1144,14 @@ def _attn_fwd_ws_persistent(
             for j in range(0, tiles_per_sm):
                 # initialize offsets
                 _, _, lo, hi, _, _ = _compute_offsets_persistent(
-                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
                 )
 
                 q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
@@ -1264,7 +1341,14 @@ def _attn_fwd_ws_persistent(
             for i in range(0, tiles_per_sm):
                 # initialize offsets
                 _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets_persistent(
-                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
                 )
 
                 # load q0
@@ -1348,7 +1432,14 @@ def _attn_fwd_ws_persistent(
             for i in range(0, tiles_per_sm):
                 # initialize offsets
                 _, _, _, _, qo_offset_y, kv_offset_y = _compute_offsets_persistent(
-                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
                 )
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
