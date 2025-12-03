@@ -405,9 +405,7 @@ class Operator(BenchmarkOperator):
             q, k, v, is_causal=self.causal, scale=self.sm_scale
         )
 
-    @register_benchmark(
-        enabled=(IS_BLACKWELL and HAS_FLASH_CUTE), label="FAv4", fwd_only=True
-    )
+    @register_benchmark(enabled=(IS_BLACKWELL and HAS_FLASH_CUTE), label="FAv4")
     def cutedsl_blackwell(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> Callable:
