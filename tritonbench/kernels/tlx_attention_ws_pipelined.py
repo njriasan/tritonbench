@@ -139,6 +139,7 @@ configs_bwd_persistent = [
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
             "EPILOGUE_SUBTILE": 2,
+            "GROUP_SIZE_M": 1,
         },
         num_warps=4,
         num_stages=1,
@@ -157,6 +158,44 @@ configs_bwd_persistent = [
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
             "EPILOGUE_SUBTILE": 2,
+            "GROUP_SIZE_M": 1,
+        },
+        num_warps=4,
+        num_stages=1,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    # Configs sometimes taken by causal H-DIM=64
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "NUM_BUFFERS_KV": 1,
+            "NUM_BUFFERS_Q": 2,
+            "NUM_BUFFERS_DO": 1,
+            "NUM_BUFFERS_DS": 1,
+            "NUM_BUFFERS_TMEM": 1,
+            "EPILOGUE_SUBTILE": 2,
+            "GROUP_SIZE_M": 4,
+        },
+        num_warps=4,
+        num_stages=1,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "NUM_BUFFERS_KV": 1,
+            "NUM_BUFFERS_Q": 2,
+            "NUM_BUFFERS_DO": 1,
+            "NUM_BUFFERS_DS": 1,
+            "NUM_BUFFERS_TMEM": 1,
+            "EPILOGUE_SUBTILE": 2,
+            "GROUP_SIZE_M": 4,
         },
         num_warps=4,
         num_stages=1,
@@ -1552,6 +1591,8 @@ def _attn_bwd_preprocess(
 def bwd_calculate_offsets_persistent(
     tile_idx,
     n_tile_num,
+    num_pid_m,
+    num_pid_in_group,
     stride_z,
     stride_h,
     stride_tok,
@@ -1559,9 +1600,12 @@ def bwd_calculate_offsets_persistent(
     N_CTX,  #
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
+    # Apply PID swizzling similar to _compute_offsets_persistent
     bhid = tile_idx // n_tile_num
     pid = tile_idx % n_tile_num
+    pid, bhid = tl.swizzle2d(pid, bhid, n_tile_num, num_pid_m, GROUP_SIZE_M)
     off_chz = (bhid * N_CTX).to(tl.int64)
     off_bh = (
         (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
@@ -1606,6 +1650,7 @@ def _attn_bwd_ws_persistent(
     NUM_BUFFERS_TMEM: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     STAGE: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     # Kernel hangs if NUM_BUFFERS_Q != 2.
     tl.static_assert(NUM_BUFFERS_Q == 2)
@@ -1624,6 +1669,8 @@ def _attn_bwd_ws_persistent(
     #   1,
     #   q.shape[0] * q.shape[1],
     n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
+    num_pid_m = Z * H
+    num_pid_in_group = GROUP_SIZE_M * n_tile_num
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
     total_tiles = n_tile_num * Z * H
@@ -1731,6 +1778,8 @@ def _attn_bwd_ws_persistent(
                     bwd_calculate_offsets_persistent(
                         tile_idx,
                         n_tile_num,
+                        num_pid_m,
+                        num_pid_in_group,
                         stride_z,
                         stride_h,
                         stride_tok,
@@ -1738,6 +1787,7 @@ def _attn_bwd_ws_persistent(
                         N_CTX,
                         BLOCK_M1,
                         BLOCK_N1,
+                        GROUP_SIZE_M,
                     )
                 )
                 curr_m = start_m
@@ -1777,6 +1827,8 @@ def _attn_bwd_ws_persistent(
                     bwd_calculate_offsets_persistent(
                         tile_idx,
                         n_tile_num,
+                        num_pid_m,
+                        num_pid_in_group,
                         stride_z,
                         stride_h,
                         stride_tok,
@@ -1784,6 +1836,7 @@ def _attn_bwd_ws_persistent(
                         N_CTX,
                         BLOCK_M1,
                         BLOCK_N1,
+                        GROUP_SIZE_M,
                     )
                 )
 
@@ -1891,6 +1944,8 @@ def _attn_bwd_ws_persistent(
                 _, _, _, _, num_steps = bwd_calculate_offsets_persistent(
                     tile_idx,
                     n_tile_num,
+                    num_pid_m,
+                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
@@ -1898,6 +1953,7 @@ def _attn_bwd_ws_persistent(
                     N_CTX,
                     BLOCK_M1,
                     BLOCK_N1,
+                    GROUP_SIZE_M,
                 )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
@@ -2083,6 +2139,8 @@ def _attn_bwd_ws_persistent(
                     bwd_calculate_offsets_persistent(
                         tile_idx,
                         n_tile_num,
+                        num_pid_m,
+                        num_pid_in_group,
                         stride_z,
                         stride_h,
                         stride_tok,
@@ -2090,6 +2148,7 @@ def _attn_bwd_ws_persistent(
                         N_CTX,
                         BLOCK_M1,
                         BLOCK_N1,
+                        GROUP_SIZE_M,
                     )
                 )
                 # Load K
