@@ -13,4 +13,6 @@ class QuackRMSNorm(torch.nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        return quack_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
+        return quack_rmsnorm(
+            hidden_states, weight=self.weight, eps=self.variance_epsilon
+        )
