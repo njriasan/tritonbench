@@ -1607,6 +1607,11 @@ def _attn_bwd_ws_persistent(
     EPILOGUE_SUBTILE: tl.constexpr,
     STAGE: tl.constexpr,
 ):
+    # Kernel hangs if NUM_BUFFERS_Q != 2.
+    tl.static_assert(NUM_BUFFERS_Q == 2)
+    # Runtime error if NUM_BUFFERS_DO != 1
+    tl.static_assert(NUM_BUFFERS_DO == 1)
+
     # If we have BLOCK_M1 == 128 and HEAD_DIM == 128 we don't have enough
     # TMEM. We may need to expand this condition across other configs in
     # the future.
