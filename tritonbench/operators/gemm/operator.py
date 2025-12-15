@@ -126,6 +126,8 @@ NON_SQUARE = [
     if shape is not None
 ]
 
+PERSISTENT_TUTORIAL_SHAPES = [(8192, 8192, 1 << k, None) for k in range(9, 15)]
+
 
 @contextlib.contextmanager
 def set_env_variable(key, value):
@@ -150,6 +152,9 @@ def parse_args(args: List[str]) -> argparse.Namespace:
     parser.add_argument("--input", type=str)
     parser.add_argument("--splitk", action="store_true", default=False)
     parser.add_argument("--non-square", action="store_true", default=False)
+    parser.add_argument(
+        "--persistent-tutorial-shapes", action="store_true", default=False
+    )
     parser.add_argument("--llama", action="store_true", default=False)
     parser.add_argument("--buffer-ops", action="store_true", default=False)
     parser.add_argument("--layout", type=str, default="tn")
@@ -198,6 +203,8 @@ class Operator(BenchmarkOperator):
             self.shapes = SPLIT_K_SHAPES
         elif gemm_args.non_square:
             self.shapes = NON_SQUARE
+        elif gemm_args.persistent_tutorial_shapes:
+            self.shapes = PERSISTENT_TUTORIAL_SHAPES
         elif gemm_args.llama:
             self.shapes = llama_shapes()
         elif gemm_args.m and gemm_args.k and gemm_args.n:
