@@ -288,20 +288,11 @@ if is_tile_enabled():
             "FADD2_REDUCE": add2reduce,
         }
         extra_kwargs = {"pre_hook": _host_descriptor_pre_hook}
-
-        # Only add minRegAutoWS/maxRegAutoWS if supported (triton/tree/ws-3.5)
-        if HAS_REG_AUTO_WS:
-            extra_kwargs["minRegAutoWS"] = 24
-            extra_kwargs["maxRegAutoWS"] = 152
-
-        if HAS_PINGPONG_AUTO_WS:
-            extra_kwargs["pingpongAutoWS"] = True
-
         return triton.Config(config_kwargs, **extra_kwargs)
 
     configs = [
         make_tile_config(BM, BN, occ, subtile, subtile_p, vectmul, add2reduce)
-        for BM in [64, 128, 256]
+        for BM in [256]
         for BN in [64, 128]
         for occ in [1, 2]
         for subtile in [True]
@@ -381,7 +372,7 @@ def prune_persistent_configs(configs, named_args, **kwargs):
 
 @triton.jit
 def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
-    if isinstance(desc_or_ptr, tl.tensor_descriptor):
+    if isinstance(desc_or_ptr, triton.language.core.tensor_descriptor_base):
         return desc_or_ptr
     else:
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
