@@ -52,6 +52,12 @@ def parse_args(args):
     parser.add_argument("--n", type=int)
     parser.add_argument("--per-tensor-scale-a", type=float, default=None)
     parser.add_argument("--per-tensor-scale-b", type=float, default=None)
+    parser.add_argument(
+        "--template-filter-regex",
+        type=str,
+        default="*",
+        help="Regex filter for PT2 Templates"
+    )
     return parser.parse_args(args)
 
 
@@ -260,9 +266,12 @@ class Operator(BenchmarkOperator):
     def pt2_fp8_gemm(self, a, b, scale_a, scale_b) -> Callable:
         torch._dynamo.reset()
         with inductor_config.patch(
-            max_autotune=True,
-            max_autotune_gemm_backends="TRITON",
-            autotune_fallback_to_aten=False,
+            {
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex":  self.extra_args.template_filter_regex,
+            }
         ):
             f = lambda a, b: torch._scaled_mm(
                 a,
