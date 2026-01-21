@@ -1004,6 +1004,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         """Benchmarking the operator and returning its metrics."""
         metrics: list[tuple[Any, dict[str, BenchmarkOperatorMetrics]]] = []
         if self.tb_args.power_chart:
+            if PowerManagerTask is None:
+                raise RuntimeError(
+                    "power_chart requires a CUDA-capable GPU with pynvml support"
+                )
             power_manager_task = PowerManagerTask.create(
                 self.benchmark_name,
                 _get_current_device_id(),
