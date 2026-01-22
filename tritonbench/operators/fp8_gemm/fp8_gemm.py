@@ -55,8 +55,8 @@ def parse_args(args):
     parser.add_argument(
         "--template-filter-regex",
         type=str,
-        default="*",
-        help="Regex filter for PT2 Templates"
+        default=".*",
+        help="Regex filter for PT2 Templates",
     )
     return parser.parse_args(args)
 
@@ -270,7 +270,7 @@ class Operator(BenchmarkOperator):
                 "max_autotune": True,
                 "max_autotune_gemm_backends": "TRITON",
                 "autotune_fallback_to_aten": False,
-                "test_configs.autotune_choice_name_regex":  self.extra_args.template_filter_regex,
+                "test_configs.autotune_choice_name_regex": self.extra_args.template_filter_regex,
             }
         ):
             f = lambda a, b: torch._scaled_mm(
