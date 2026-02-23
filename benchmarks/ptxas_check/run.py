@@ -13,7 +13,6 @@ Usage:
 import argparse
 import json
 import os
-import pickle
 import sys
 from typing import Any, Dict, List, Tuple
 
@@ -27,36 +26,36 @@ setup_tritonbench_cwd()
 from tritonbench.utils.run_utils import run_config, run_in_task
 
 
-def find_pkl_files(path: str) -> List[str]:
+def find_pt_files(path: str) -> List[str]:
     abs_path = os.path.abspath(path)
     if not os.path.exists(abs_path):
         return []
     return [
         f
         for f in os.listdir(abs_path)
-        if os.path.isfile(os.path.join(abs_path, f)) and f.endswith(".pkl")
+        if os.path.isfile(os.path.join(abs_path, f)) and f.endswith(".pt")
     ]
 
 
-def find_stderr_file(path: str) -> str:
+def find_file_with_suffix(path: str, suffix: str = "stderr.log") -> str:
     abs_path = os.path.abspath(path)
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Directory {path} does not exist")
 
-    stderr_files = [
+    target_files = [
         f
         for f in os.listdir(abs_path)
-        if os.path.isfile(os.path.join(abs_path, f)) and f.endswith("stderr.log")
+        if os.path.isfile(os.path.join(abs_path, f)) and f.endswith(suffix)
     ]
-    assert len(stderr_files) == 1, (
-        f"Expected exactly one stderr file, found {len(stderr_files)}"
+    assert len(target_files) == 1, (
+        f"Expected exactly one stderr file, found {len(target_files)}"
     )
-    return stderr_files[0]
+    return target_files[0]
 
 
-def load_pickle(filepath: str) -> Any:
+def load_pt(filepath: str) -> Any:
     with open(filepath, "rb") as f:
-        return pickle.load(f)
+        return torch.load(f)
 
 
 def check_tensor_numeric(a: Any, b: Any) -> bool:
@@ -78,22 +77,43 @@ def check_tensor_numeric(a: Any, b: Any) -> bool:
     return a == b
 
 
-def load_best_config_from_stderr(file_path: str):
+def load_best_config_from_stderr(file_path: str) -> str | None:
     config = None
+    config_type = None
     with open(file_path, "r") as f:
         lines = f.readlines()
         for lineno, line in enumerate(lines):
             if "Autotune Choices Stats:" in line:
                 config = lines[lineno + 1].strip()
-    if not config:
+                config_type = "pt2"
+            if "best config selected:" in line:
+                config = line[len("best config selected: ") :].strip()
+                config_type = "triton"
+    if not config_type:
         return None
-    config_dict = json.loads(config)
-    return config_dict["best_kernel_desc"]
+    elif config_type == "triton":
+        # triton style autotune config
+        return config
+    else:
+        # pt2 style autotune config
+        config_dict = json.loads(config)
+        return config_dict.get("best_kernel_desc", None)
+
+
+def load_perf_results(stdout_file: str) -> Tuple[Any] | None:
+    with open(stdout_file, "r") as f:
+        lines = f.readlines()
+        if len(lines) == 0:
+            return None
+        last_line = lines[-1].split(",")
+    try:
+        results = [float(x) for x in last_line]
+    except ValueError:
+        return None
+    return tuple(results)
 
 
 def compare_configs(config_a: Any, config_b: Any) -> bool:
-    print(f"data a: {config_a}")
-    print(f"data b: {config_b}")
     if config_a is None and config_b is None:
         return True
     if config_a is None or config_b is None:
@@ -118,6 +138,9 @@ def run_tritonbench(
     cmd.extend(extra_args)
     cmd.extend(["--export", "both", "--export-dir", export_dir])
 
+    env["TRITON_ALWAYS_COMPILE"] = "1"
+    env["TRITON_PRINT_AUTOTUNING"] = "1"
+
     if config_file:
         result = run_config(
             config_file=config_file,
@@ -140,11 +163,31 @@ def run_tritonbench(
 def compare_outputs(dir_a: str, dir_b: str) -> Tuple[bool, List[str]]:
     issues = []
 
-    stderr_files_a = find_stderr_file(dir_a)
-    stderr_files_b = find_stderr_file(dir_b)
+    stderr_files_a = find_file_with_suffix(dir_a, suffix="stderr.log")
+    stderr_files_b = find_file_with_suffix(dir_b, suffix="stderr.log")
     assert stderr_files_b == stderr_files_a, (
         f"Expected same stderr files, found {stderr_files_b} and {stderr_files_a}"
     )
+
+    stdout_files_a = find_file_with_suffix(dir_a, suffix="stdout.log")
+    stdout_files_b = find_file_with_suffix(dir_b, suffix="stdout.log")
+    assert stdout_files_a == stdout_files_b, (
+        f"Expected same stderr files, found {stdout_files_a} and {stdout_files_b}"
+    )
+    perf_a = load_perf_results(os.path.join(dir_a, stdout_files_a))
+    perf_b = load_perf_results(os.path.join(dir_b, stdout_files_b))
+    if perf_a and perf_b:
+        print(f"[ptxas-check] perf check: {perf_b} -> {perf_a} ✓")
+    elif perf_a and not perf_b:
+        issues.append(
+            f"Perf results mismatch: only found in run with PTXAS_OPTIONS: {perf_a}"
+        )
+    elif not perf_a and perf_b:
+        issues.append(
+            f"Perf results mismatch: only found in run without PTXAS_OPTIONS: {perf_b}"
+        )
+    else:
+        issues.append("Perf results are missing.")
 
     path_a = os.path.join(dir_a, stderr_files_a)
     path_b = os.path.join(dir_b, stderr_files_a)
@@ -152,30 +195,32 @@ def compare_outputs(dir_a: str, dir_b: str) -> Tuple[bool, List[str]]:
     data_b = load_best_config_from_stderr(path_b)
 
     if not compare_configs(data_a, data_b):
-        issues.append(f"Config mismatch in {stderr_files_a}")
+        issues.append(f"Autotune config mismatch in {stderr_files_a}")
         issues.append(f"  With PTXAS_OPTIONS: {data_a}")
         issues.append(f"  Without PTXAS_OPTIONS: {data_b}")
     else:
         print(f"[ptxas-check] {stderr_files_a}: configs match ✓")
 
-    pkl_files_a = set(find_pkl_files(dir_a))
-    pkl_files_b = set(find_pkl_files(dir_b))
-    common_pkl = pkl_files_a & pkl_files_b
-    only_in_a = pkl_files_a - pkl_files_b
-    only_in_b = pkl_files_b - pkl_files_a
+    pt_files_a = set(find_pt_files(dir_a))
+    pt_files_b = set(find_pt_files(dir_b))
+    common_pkl = pt_files_a & pt_files_b
+    only_in_a = pt_files_a - pt_files_b
+    only_in_b = pt_files_b - pt_files_a
 
     if only_in_a:
-        issues.append(f"PKL files only in run with PTXAS_OPTIONS: {sorted(only_in_a)}")
+        issues.append(f"PT files only in run with PTXAS_OPTIONS: {sorted(only_in_a)}")
     if only_in_b:
         issues.append(
-            f"PKL files only in run without PTXAS_OPTIONS: {sorted(only_in_b)}"
+            f"PT files only in run without PTXAS_OPTIONS: {sorted(only_in_b)}"
         )
+    if not common_pkl:
+        issues.append("Numeric files are missing.")
 
     for pkl_file in sorted(common_pkl):
         path_a = os.path.join(dir_a, pkl_file)
         path_b = os.path.join(dir_b, pkl_file)
-        data_a = load_pickle(path_a)
-        data_b = load_pickle(path_b)
+        data_a = load_pt(path_a)
+        data_b = load_pt(path_b)
         if not check_tensor_numeric(data_a, data_b):
             issues.append(f"Numeric mismatch in {pkl_file}")
         else:
@@ -189,23 +234,29 @@ def main() -> int:
         description="PTXAS Options Compatibility Check",
         usage="%(prog)s [options] -- <tritonbench args>",
     )
-    parser.add_argument("--config-file", type=str, help="Config file to use")
     args, extra_args = parser.parse_known_args()
 
     if "--" in extra_args:
         extra_args.remove("--")
 
-    ptxas_options = os.environ.get("PTXAS_OPTIONS")
+    ptxas_options = os.environ.get("PTXAS_OPTIONS", None)
     if ptxas_options is None:
         print("[ptxas-check] ERROR: PTXAS_OPTIONS environment variable is not set.")
         print("[ptxas-check] Please set PTXAS_OPTIONS before running this benchmark.")
-        print("[ptxas-check] Example: PTXAS_OPTIONS='-v' buck2 run ... -- --op gemm")
+        print("[ptxas-check] Example: PTXAS_OPTIONS='-v' python -m benchmarks.ptxas_check.run")
+        return 1
+
+    config_file = os.environ.get("TRITONBENCH_RUN_CONFIG", None)
+    if config_file is None:
+        print("[ptxas-check] ERROR: TRITONBENCH_RUN_CONFIG environment variable is not set.")
+        print("[ptxas-check] Please set TRITONBENCH_RUN_CONFIG before running this benchmark.")
+        print("[ptxas-check] Example: TRITONBENCH_RUN_CONFIG='benchmarks/run_config/....yaml' python -m benchmarks.ptxas_check.run")
         return 1
 
     print("[ptxas-check] PTXAS Options Compatibility Check")
     print(f"[ptxas-check] PTXAS_OPTIONS: {ptxas_options}")
     print(
-        f"[ptxas-check] Config file: {args.config_file if args.config_file else '<not set>'}"
+        f"[ptxas-check] Config file: {config_file if config_file else '<not set>'}"
     )
     print(f"[ptxas-check] Extra args: {extra_args}")
     print()
@@ -216,7 +267,7 @@ def main() -> int:
     output_dir_with = os.path.join(output_dir, "with_ptxas_options")
     os.mkdir(output_dir_with)
     env_with = os.environ.copy()
-    rc1 = run_tritonbench(args.config_file, extra_args, output_dir_with, env_with)
+    rc1 = run_tritonbench(config_file, extra_args, output_dir_with, env_with)
     print()
 
     print("[ptxas-check] === Run 2: WITHOUT PTXAS_OPTIONS ===")
@@ -224,7 +275,7 @@ def main() -> int:
     os.mkdir(output_dir_without)
     env_without = os.environ.copy()
     env_without.pop("PTXAS_OPTIONS", None)
-    rc2 = run_tritonbench(args.config_file, extra_args, output_dir_without, env_without)
+    rc2 = run_tritonbench(config_file, extra_args, output_dir_without, env_without)
     print()
 
     if rc1 != 0:
@@ -241,7 +292,7 @@ def main() -> int:
     print()
 
     match, issues = compare_outputs(output_dir_with, output_dir_without)
-
+    print("[ptxas-check] === REPORT ===")
     if match:
         print("[ptxas-check] ✓ SUCCESS: Outputs and configs match!")
         print("[ptxas-check] PTXAS_OPTIONS does not affect benchmark results.")
