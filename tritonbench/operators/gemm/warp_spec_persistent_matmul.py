@@ -63,7 +63,7 @@ if include_small_configs:
     default_s_range = small_stage_range
     tma_persistent_s_range = small_stage_range
 else:
-    bm_range = [128]
+    bm_range = [128, 256]
     bn_range = [128, 256]
     bk_range = [64, 128]
     default_s_range = [3, 4]
@@ -130,7 +130,7 @@ def _prune_warp_specialize_configs(configs, named_args, **kwargs):
 
 
 def matmul_tma_set_block_size_hook(nargs):
-    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
+    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 1)
     BLOCK_M = nargs["BLOCK_SIZE_M"]
     BLOCK_N = nargs["BLOCK_SIZE_N"]
     BLOCK_K = nargs["BLOCK_SIZE_K"]
@@ -146,10 +146,7 @@ def matmul_tma_set_block_size_hook(nargs):
     nargs["b_desc"].block_shape = b_block_shape
     c = nargs.get("c_desc_or_ptr")
     if isinstance(c, TensorDescriptor):
-        if EPILOGUE_SUBTILE:
-            c.block_shape = [BLOCK_M, BLOCK_N // 2]
-        else:
-            c.block_shape = [BLOCK_M, BLOCK_N]
+        c.block_shape = [BLOCK_M, BLOCK_N // EPILOGUE_SUBTILE]
 
 
 @triton.autotune(
@@ -305,7 +302,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
             new_kwargs["BLOCK_SIZE_N"] = new_kwargs.pop("BLOCK_N")
             new_kwargs["BLOCK_SIZE_K"] = new_kwargs.pop("BLOCK_K")
             new_kwargs["GROUP_SIZE_M"] = new_kwargs.pop("GROUP_M")
-            for SUBTILE in [True, False]:
+            for SUBTILE in [1, 2, 4]:
                 for FLATTEN in [True, False]:
                     kwargs = {
                         "EPILOGUE_SUBTILE": SUBTILE,
@@ -342,7 +339,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
             for BK in bk_range  #
             for s in tma_persistent_s_range  #
             for w in [4, 8]  #
-            for SUBTILE in [True, False]  #
+            for SUBTILE in [1, 2, 4]  #
             for FLATTEN in [True, False]  #
         ]
 
@@ -357,6 +354,9 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
     ws = kwargs.get("WARP_SPECIALIZE", False)
     kept = []
     for c in configs:
+        subtile = c.kwargs.get("EPILOGUE_SUBTILE", 1)
+        if c.kwargs.get("BLOCK_SIZE_N", 1) % subtile != 0:
+            continue
         flatten = c.kwargs.get("FLATTEN", False)
         if not ws:
             if flatten:
@@ -449,9 +449,10 @@ def matmul_kernel_tma_persistent(
             # Epilogue subtiling is a technique to break our computation and stores
             # into multiple pieces. By subtiling we can reduce shared memory consumption
             # by the epilogue and instead use that memory to increase our stage count.
-            # In this case we partition the accumulator into
-            # 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
-            if EPILOGUE_SUBTILE:
+            if EPILOGUE_SUBTILE == 1:
+                accumulator = accumulator.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c], accumulator)
+            elif EPILOGUE_SUBTILE == 2:
                 acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
                 acc = tl.permute(acc, (0, 2, 1))
                 acc0, acc1 = tl.split(acc)
@@ -459,9 +460,26 @@ def matmul_kernel_tma_persistent(
                 c_desc_or_ptr.store([offs_am_c, offs_bn_c], c0)
                 c1 = acc1.to(dtype)
                 c_desc_or_ptr.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+            elif EPILOGUE_SUBTILE == 4:
+                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+                acc = tl.permute(acc, (0, 2, 1))
+                acc_lo, acc_hi = tl.split(acc)
+                acc_lo = tl.reshape(acc_lo, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+                acc_lo = tl.permute(acc_lo, (0, 2, 1))
+                acc0, acc1 = tl.split(acc_lo)
+                acc_hi = tl.reshape(acc_hi, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+                acc_hi = tl.permute(acc_hi, (0, 2, 1))
+                acc2, acc3 = tl.split(acc_hi)
+                c0 = acc0.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c], c0)
+                c1 = acc1.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 4], c1)
+                c2 = acc2.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c + 2 * BLOCK_SIZE_N // 4], c2)
+                c3 = acc3.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c + 3 * BLOCK_SIZE_N // 4], c3)
             else:
-                accumulator = accumulator.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c], accumulator)
+                tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
         else:
             accumulator = accumulator.to(dtype)
             offs_cm = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
@@ -471,7 +489,7 @@ def matmul_kernel_tma_persistent(
             tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def blackwell_matmul_tma_persistent(a, b, warp_specialize: bool, tma_store: bool = False):
+def blackwell_matmul_tma_persistent(a, b, warp_specialize: bool, tma_store: bool = True):
     # High-Level Options for B's layout
     # 1. (K, N) contiguous in N
     # 2. (K, N) contiguous in K
@@ -623,7 +641,7 @@ def matmul_kernel_descriptor_persistent(
         strides=[c_stride, 1],
         block_shape=[
             BLOCK_SIZE_M,
-            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+            BLOCK_SIZE_N // EPILOGUE_SUBTILE,
         ],
     )
 
@@ -665,7 +683,10 @@ def matmul_kernel_descriptor_persistent(
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
-        if EPILOGUE_SUBTILE:
+        if EPILOGUE_SUBTILE == 1:
+            c = accumulator.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c)
+        elif EPILOGUE_SUBTILE == 2:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
@@ -673,9 +694,26 @@ def matmul_kernel_descriptor_persistent(
             c_desc.store([offs_cm, offs_cn], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc_lo, acc_hi = tl.split(acc)
+            acc_lo = tl.reshape(acc_lo, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+            acc_lo = tl.permute(acc_lo, (0, 2, 1))
+            acc0, acc1 = tl.split(acc_lo)
+            acc_hi = tl.reshape(acc_hi, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+            acc_hi = tl.permute(acc_hi, (0, 2, 1))
+            acc2, acc3 = tl.split(acc_hi)
+            c0 = acc0.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c0)
+            c1 = acc1.to(dtype)
+            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 4], c1)
+            c2 = acc2.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 2 * BLOCK_SIZE_N // 4], c2)
+            c3 = acc3.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 3 * BLOCK_SIZE_N // 4], c3)
         else:
-            c = accumulator.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c)
+            tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
 
 
 def blackwell_matmul_descriptor_persistent(a, b, warp_specialize: bool):
