@@ -144,10 +144,12 @@ def matmul_tma_set_block_size_hook(nargs):
     else:
         b_block_shape = [BLOCK_K, BLOCK_N]
     nargs["b_desc"].block_shape = b_block_shape
-    if EPILOGUE_SUBTILE:
-        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
-    else:
-        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
+    c = nargs.get("c_desc_or_ptr")
+    if isinstance(c, TensorDescriptor):
+        if EPILOGUE_SUBTILE:
+            c.block_shape = [BLOCK_M, BLOCK_N // 2]
+        else:
+            c.block_shape = [BLOCK_M, BLOCK_N]
 
 
 @triton.autotune(
@@ -378,10 +380,12 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
 def matmul_kernel_tma_persistent(
     a_desc,
     b_desc,
-    c_desc,  #
+    c_desc_or_ptr,  #
     M,
     N,
     K,  #
+    stride_cm,
+    stride_cn,  #
     BLOCK_SIZE_M: tl.constexpr,  #
     BLOCK_SIZE_N: tl.constexpr,  #
     BLOCK_SIZE_K: tl.constexpr,  #
@@ -393,6 +397,7 @@ def matmul_kernel_tma_persistent(
     DTYPE: tl.constexpr,
     TRANSPOSE_A: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
+    TMA_STORE: tl.constexpr,
 ):
     dtype = DTYPE
     start_pid = tl.program_id(axis=0)
@@ -440,24 +445,33 @@ def matmul_kernel_tma_persistent(
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
-        # Epilogue subtiling is a technique to break our computation and stores into multiple pieces
-        # By subtiling we can reduce shared memory consumption by the epilogue and instead use that
-        # memory to increase our stage count.
-        # In this case we partition the accumulator into 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
-        if EPILOGUE_SUBTILE:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            c0 = acc0.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], c0)
-            c1 = acc1.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+        if TMA_STORE:
+            # Epilogue subtiling is a technique to break our computation and stores
+            # into multiple pieces. By subtiling we can reduce shared memory consumption
+            # by the epilogue and instead use that memory to increase our stage count.
+            # In this case we partition the accumulator into
+            # 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
+            if EPILOGUE_SUBTILE:
+                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+                acc = tl.permute(acc, (0, 2, 1))
+                acc0, acc1 = tl.split(acc)
+                c0 = acc0.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c], c0)
+                c1 = acc1.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+            else:
+                accumulator = accumulator.to(dtype)
+                c_desc_or_ptr.store([offs_am_c, offs_bn_c], accumulator)
         else:
             accumulator = accumulator.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], accumulator)
+            offs_cm = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = offs_bn_c + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = c_desc_or_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def blackwell_matmul_tma_persistent(a, b, warp_specialize: bool):
+def blackwell_matmul_tma_persistent(a, b, warp_specialize: bool, tma_store: bool = False):
     # High-Level Options for B's layout
     # 1. (K, N) contiguous in N
     # 2. (K, N) contiguous in K
@@ -505,10 +519,13 @@ def blackwell_matmul_tma_persistent(a, b, warp_specialize: bool):
         b_desc = TensorDescriptor(b, [N, K], b_strides, dummy_block)
     else:
         b_desc = TensorDescriptor(b, [K, N], b_strides, dummy_block)
-    c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+    if tma_store:
+        c_desc_or_ptr = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+    else:
+        c_desc_or_ptr = c
 
     def grid(META):
-        nonlocal a_desc, b_desc, c_desc
+        nonlocal a_desc, b_desc, c_desc_or_ptr
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
         return (
@@ -521,15 +538,18 @@ def blackwell_matmul_tma_persistent(a, b, warp_specialize: bool):
     matmul_kernel_tma_persistent[grid](
         a_desc,
         b_desc,
-        c_desc,  #
+        c_desc_or_ptr,  #
         M,
         N,
         K,  #
+        c.stride(0),
+        c.stride(1),  #
         NUM_SMS=NUM_SMS,  #
         WARP_SPECIALIZE=warp_specialize,  #
         DTYPE=torch_dtype_to_triton_dtype(dtype),  #
         TRANSPOSE_A=transpose_a,
         TRANSPOSE_B=transpose_b,
+        TMA_STORE=tma_store,
     )
     return c
 
