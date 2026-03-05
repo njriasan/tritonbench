@@ -50,29 +50,19 @@ try:
 except ImportError:
     usage_report_logger = lambda *args, **kwargs: None
 
-FWD_ONLY_OPS = ["triton_dot_compress", "triton_group_index_select"]
-BWD_ARGS_OPS = {
-    # flash_attention/triton_tutorial_flash_v2 does not support non-causal in backward
-    "flash_attention": ["--causal"],
-    # pffn_baseline does not support backward
-    "generalized_dot_product_attention": [
-        "--skip",
-        "pffn_baseline,mkl_jfav3",
-    ],
-}
-
-DEVICE_ENV_CHECK = {
-    "h100": is_h100,
-    "b200": is_blackwell,
-    "cuda": is_cuda,
-    "hip": is_hip,
-}
-
-TRITON_ENV_CHECK = {
-    "triton-main": is_triton_main,
-    "triton-beta": is_triton_beta,
-    "meta-triton": is_meta_triton,
-    "triton-stable": is_triton_stable,
+ENV_CHECK_MAP = {
+    "devices": {
+        "h100": is_h100,
+        "b200": is_blackwell,
+        "cuda": is_cuda,
+        "hip": is_hip,
+    },
+    "channels": {
+        "triton-main": is_triton_main,
+        "triton-beta": is_triton_beta,
+        "meta-triton": is_meta_triton,
+        "triton-stable": is_triton_stable,
+    },
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -135,40 +125,16 @@ def _env_get_str(var_name: str, default: str) -> str:
     return value.strip() or default
 
 
-def _triton_env_check(benchmark_config: Dict[str, str], mode: str = "any") -> bool:
-    triton_channels = benchmark_config.get("triton_channels", None)
-    if triton_channels is None:
+def _env_check(benchmark_config: Dict[str, str], field_name: str) -> bool:
+    """True means we should run the benchmark, False means we should skip it."""
+    check_map = ENV_CHECK_MAP[field_name]
+    field_val = benchmark_config.get(field_name, None)
+    assert field_val is None or all(
+        [field_val in check_map for field_val in check_map]
+    ), f"Unknown {field_name} value: {field_val}"
+    if field_val is None:
         return True
-    assert all([channel in TRITON_ENV_CHECK for channel in triton_channels]), (
-        f"Unknown triton_channel: {triton_channels}"
-    )
-    if mode == "any":
-        if triton_channels is None:
-            return True
-        return any([TRITON_ENV_CHECK[channel]() for channel in triton_channels])
-    elif mode == "all":
-        if triton_channels is None:
-            return False
-        return all([TRITON_ENV_CHECK[channel]() for channel in triton_channels])
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-
-def _device_env_check(benchmark_config: Dict[str, str], mode: str = "any") -> bool:
-    devices = benchmark_config.get("devices", None)
-    assert device == None or all([device in DEVICE_ENV_CHECK for device in devices]), (
-        f"Unknown device: {devices}"
-    )
-    if mode == "any":
-        if devices is None:
-            return True
-        return any([DEVICE_ENV_CHECK[channel]() for device in devices])
-    elif mode == "all":
-        if devices is None:
-            return False
-        return all([DEVICE_ENV_CHECK[channel]() for device in devices])
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
+    return any([check_map[val]() for val in field_val])
 
 
 def _get_helion_root():
@@ -400,8 +366,8 @@ def run_config(
             config_extra_envs.update(extra_envs)
         disabled = (
             benchmark_config.get("disabled", False)
-            and _device_env_check(benchmark_config)
-            and _triton_env_check(benchmark_config)
+            or not _env_check(benchmark_config, "devices")
+            or not _env_check(benchmark_config, "channels")
         )
         if disabled:
             logger.info(f"Skipping disabled benchmark {benchmark_name}.")
@@ -428,12 +394,9 @@ def load_operator_by_args(task_args: List[str]):
 def run_one_operator(task_args: List[str], with_bwd: bool = False):
     op = load_operator_by_args(task_args)
     op.run()
-    if with_bwd and op.has_bwd() and not op.name in FWD_ONLY_OPS:
+    if with_bwd and op.has_bwd():
         op_name = copy.deepcopy(op.name)
         del op
-        if op_name in BWD_ARGS_OPS:
-            task_args = copy.deepcopy(task_args)
-            task_args.extend(BWD_ARGS_OPS[op_name])
         task_args.extend(["--mode", "bwd"])
         op = load_operator_by_args(task_args)
         op.run()

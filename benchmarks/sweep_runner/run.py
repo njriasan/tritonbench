@@ -91,11 +91,11 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     return parsed_args
 
 
-def load_config(config_file: str) -> Dict[str, Any]:
+def load_config(config_file: str, base_dir=CURRENT_DIR) -> Dict[str, Any]:
     """Load and parse the YAML config file."""
     config_path = Path(config_file)
     if not config_path.exists():
-        config_path = Path(CURRENT_DIR).joinpath(config_file)
+        config_path = Path(base_dir).joinpath(config_file)
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_file}")
 
@@ -125,22 +125,39 @@ def generate_run_config(
     Returns:
         A dictionary in TRITONBENCH_RUN_CONFIG format
     """
+    if skip_tests := sweep_runner_config["run_config"].get("skip_tests", None):
+        skip_tests = [
+            load_config(skip_test, base_dir=REPO_PATH) for skip_test in skip_tests
+        ]
     run_config = get_benchmark_config_with_tags(
         tags=sweep_runner_config["run_config"]["tags"],
         per_backend=separate_backends,
+        with_backwards=sweep_runner_config["run_config"].get("with_backwards", False),
+        metrics=sweep_runner_config["run_config"].get("metrics", None),
+        skip_tests=skip_tests,
     )
     result_configs = {}
-    result_configs["common_args"] = f"--launch benchmarks.{target}.run"
     if attach_output_dir:
+        result_configs["common_args"] = f"--launch benchmarks.{target}.run"
         result_configs["common_args"] += (
             f" --output-dir .benchmarks/{target}/" + "run-${timestamp}"
         )
     if extra_args:
+        if "common_args" not in result_configs:
+            result_configs["common_args"] = ""
         result_configs["common_args"] += " " + " ".join(extra_args)
+
+    disabled_benchmarks = sweep_runner_config.get("disabled", {})
+    override_benchmarks = sweep_runner_config.get("overrides", {})
 
     for cid, c in enumerate(run_config):
         if num_configs is not None and cid >= num_configs:
             break
+        if c in disabled_benchmarks:
+            continue
+        if c in override_benchmarks:
+            result_configs[c] = override_benchmarks[c].copy()
+            continue
         result_configs[c] = run_config[c].copy()
     return result_configs
 
