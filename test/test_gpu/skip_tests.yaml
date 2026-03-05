@@ -17,6 +17,9 @@ flash_attention:
 blackwell_attentions:
   devices:
     - b200
+nvfp4_gemm:
+  devices:
+    - b200
 fp32_to_mx4:
   devices:
     - cuda
