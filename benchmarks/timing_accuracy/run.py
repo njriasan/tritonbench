@@ -17,6 +17,7 @@ from ..common import setup_output_dir, setup_tritonbench_cwd
 setup_tritonbench_cwd()
 
 from tritonbench.utils.parser import get_parser
+from tritonbench.utils.scuba_utils import decorate_benchmark_data, log_benchmark
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -81,19 +82,21 @@ class MethodStats:
             "rep": self.rep,
             "benchmark_time_s": self.benchmark_time,
             "intra_test": {
-                "avg_median_ms": statistics.mean(self.intra_test_medians)
-                if self.intra_test_medians
-                else 0,
-                "avg_std_ms": statistics.mean(self.intra_test_stds)
-                if self.intra_test_stds
-                else 0,
+                "avg_median_ms": (
+                    statistics.mean(self.intra_test_medians)
+                    if self.intra_test_medians
+                    else 0
+                ),
+                "avg_std_ms": (
+                    statistics.mean(self.intra_test_stds) if self.intra_test_stds else 0
+                ),
                 "avg_cv": self.avg_intra_test_cv,
-                "avg_min_ms": statistics.mean(self.intra_test_mins)
-                if self.intra_test_mins
-                else 0,
-                "avg_max_ms": statistics.mean(self.intra_test_maxs)
-                if self.intra_test_maxs
-                else 0,
+                "avg_min_ms": (
+                    statistics.mean(self.intra_test_mins) if self.intra_test_mins else 0
+                ),
+                "avg_max_ms": (
+                    statistics.mean(self.intra_test_maxs) if self.intra_test_maxs else 0
+                ),
             },
             "inter_test": {
                 "median_ms": self.inter_test_median,
@@ -169,9 +172,9 @@ def run_do_bench_gpu_events(fn: Callable, warmup: int, rep: int) -> List[float]:
 
 
 BENCHMARK_METHODS = {
-    "standard": ("triton do_bench (standard)", run_do_bench_standard),
+    "triton_do_bench": ("triton do_bench (standard)", run_do_bench_standard),
     "profiler": ("profiler", run_do_bench_profiler),
-    "cudagraph": ("CUDA graph", run_do_bench_cudagraph),
+    "triton_do_bench_cudagraph": ("Triton do_bench CUDA graph", run_do_bench_cudagraph),
     "entropy": ("entropy-based", run_do_bench_entropy),
     "profiler_cudagraph": ("profiler + CUDA graph", run_do_bench_profiler_cudagraph),
     "gpu_events": ("GPU events", run_do_bench_gpu_events),
@@ -265,12 +268,20 @@ def print_summary_table(results: Dict[str, MethodStats], operation_name: str):
     )
 
 
-def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List[str]):
+def _run(
+    args: argparse.Namespace,
+    tb_args: argparse.Namespace,
+    extra_args: List[str],
+    output_dir: str,
+):
     device_name = torch.cuda.get_device_name()
     logger.info(f"Loading operator: {tb_args.op}")
 
     # Use existing tritonbench infrastructure to load operator
     from tritonbench.utils.run_utils import load_operator_by_args
+    from tritonbench.utils.triton_op import _translate_mode
+
+    _translate_mode(tb_args)
 
     tb_arg_list = [
         "--op",
@@ -291,6 +302,7 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
     tb_arg_list.extend(extra_args)
 
     opbench = load_operator_by_args(tb_arg_list)
+    tb_args = opbench.tb_args
     opbench.example_inputs = opbench.get_example_inputs()
 
     if opbench.example_inputs is None:
@@ -325,7 +337,7 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
         f"{tb_args.op}_{tb_args.mode}:{backend_name}_input_id={tb_args.input_id}"
     )
     logger.info(
-        f"[timing_accuracy] Device: {device_name}, Op: {tb_args.op}, Backend: {backend_name}, Tests: {args.n_tests}, Warmup: {tb_args.warmup}, Reps: {tb_args.rep}\n"
+        f"[timing_accuracy] Device: {device_name}, Op: {tb_args.op}, Mode: {tb_args.mode}, Backend: {backend_name}, Tests: {args.n_tests}, Warmup: {tb_args.warmup}, Reps: {tb_args.rep}\n"
     )
 
     # Determine methods to run
@@ -347,7 +359,7 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
         logger.info(f"\n{'=' * 60}\nBenchmarking: {method_display_name}\n{'=' * 60}")
 
         stats = benchmark_method(
-            method_name=method_display_name,
+            method_name=method_key,
             method_fn=method_fn,
             kernel_fn=kernel_fn,
             n_tests=args.n_tests,
@@ -360,30 +372,108 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
 
     print_summary_table(results, operation_name)
 
-    if args.dump_json or args.output_dir:
-        if not args.output_dir:
-            timestamp, output_dir = setup_output_dir(bm_name="timing_accuracy")
-            args.output_dir = output_dir
-        if not os.path.exists(args.output_dir):
-            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        output = os.path.join(args.output_dir, f"{operation_name}.json")
-        output_data = {
-            "config": {
-                "device": device_name,
-                "operator": tb_args.op,
-                "backend": backend_name,
-                "input_id": tb_args.input_id,
-                "mode": tb_args.mode,
-                "precision": tb_args.precision,
-                "n_tests": args.n_tests,
-                "rep": tb_args.rep,
-                "warmup": tb_args.warmup,
-            },
-            "results": {name: stats.to_dict() for name, stats in results.items()},
-        }
-        with open(output, "w") as f:
-            json.dump(output_data, f, indent=2)
-        logger.info(f"Results saved to: {output}")
+    if not output_dir:
+        return
+
+    if not os.path.exists(output_dir):
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    output = os.path.join(output_dir, f"{operation_name}.json")
+    output_data = {
+        "config": {
+            "device": device_name,
+            "operator": tb_args.op,
+            "backend": backend_name,
+            "input_id": tb_args.input_id,
+            "mode": tb_args.mode,
+            "precision": tb_args.precision,
+            "n_tests": args.n_tests,
+            "rep": tb_args.rep,
+            "warmup": tb_args.warmup,
+        },
+        "results": {name: stats.to_dict() for name, stats in results.items()},
+    }
+    with open(output, "w") as f:
+        json.dump(output_data, f, indent=2)
+    logger.info(f"Results saved to: {output}")
+
+
+def aggregate_outputs(
+    name: str,
+    run_timestamp: str,
+    output_dir: str,
+    ci: bool = False,
+    result_file_name: str = "result.json",
+) -> Dict[str, Any]:
+    """
+    Aggregate output json files from multiple runs into a single file "result.json".
+    """
+
+    def _find_all_result_files(output_dir: str) -> List[str]:
+        return [
+            os.path.join(output_dir, f)
+            for f in os.listdir(output_dir)
+            if f.endswith(".json")
+        ]
+
+    def _process_single_result(result) -> Dict[str, Any]:
+        out = {}
+        op_name = result["config"]["operator"]
+        mode = result["config"]["mode"]
+        backend = result["config"]["backend"]
+        input_id = result["config"]["input_id"]
+        prefix = f"tritonbench_{op_name}_{mode}[input_id_{input_id}-{backend}]-"
+        out[f"{prefix}precision"] = result["config"]["precision"]
+        out[f"{prefix}warmup"] = result["config"]["warmup"]
+        out[f"{prefix}ntests"] = result["config"]["n_tests"]
+        out[f"{prefix}rep"] = result["config"]["rep"]
+        for method_name, method_stats in result["results"].items():
+            method_key = method_stats["method_name"]
+            out[f"{prefix}{method_key}-benchmark_time_s"] = method_stats[
+                "benchmark_time_s"
+            ]
+            out[f"{prefix}{method_key}-intra_test_avg_median_ms"] = method_stats[
+                "intra_test"
+            ]["avg_median_ms"]
+            out[f"{prefix}{method_key}-intra_test_avg_std_ms"] = method_stats[
+                "intra_test"
+            ]["avg_std_ms"]
+            out[f"{prefix}{method_key}-intra_test_avg_cv"] = method_stats["intra_test"][
+                "avg_cv"
+            ]
+            out[f"{prefix}{method_key}-intra_test_avg_min_ms"] = method_stats[
+                "intra_test"
+            ]["avg_min_ms"]
+            out[f"{prefix}{method_key}-intra_test_avg_max_ms"] = method_stats[
+                "intra_test"
+            ]["avg_max_ms"]
+            out[f"{prefix}{method_key}-inter_test_median_ms"] = method_stats[
+                "inter_test"
+            ]["median_ms"]
+            out[f"{prefix}{method_key}-inter_test_std_ms"] = method_stats["inter_test"][
+                "std_ms"
+            ]
+            out[f"{prefix}{method_key}-inter_test_cv"] = method_stats["inter_test"][
+                "cv"
+            ]
+            out[f"{prefix}{method_key}-inter_test_min_ms"] = method_stats["inter_test"][
+                "min_ms"
+            ]
+        return out
+
+    all_result_files = _find_all_result_files(output_dir)
+    assert len(all_result_files) > 0, (
+        f"No result files found in output dir {output_dir}!"
+    )
+    aggregated_data = []
+    for result_file in all_result_files:
+        with open(result_file, "r") as f:
+            single_result = json.load(f)
+        aggregated_data.append(_process_single_result(single_result))
+    benchmark_data = decorate_benchmark_data(name, run_timestamp, ci, aggregated_data)
+    result_file_path = os.path.join(output_dir, result_file_name)
+    with open(result_file_path, "w") as f:
+        json.dump(benchmark_data, f, indent=4)
+    return benchmark_data
 
 
 def run(args: Optional[List[str]] = None):
@@ -410,6 +500,11 @@ def run(args: Optional[List[str]] = None):
     parser.add_argument(
         "--ci", action="store_true", help="Run in CI mode (run all tests in ci.yaml)"
     )
+    parser.add_argument(
+        "--log-scuba",
+        action="store_true",
+        help="Log results to Scuba",
+    )
     parser.add_argument("--output-dir", type=str, default=None, help="Output JSON path")
     parser.add_argument("--quiet", action="store_true")
 
@@ -418,17 +513,36 @@ def run(args: Optional[List[str]] = None):
         sys.exit(1)
 
     args, extra_args = parser.parse_known_args(args)
+
     if args.ci:
         from tritonbench.utils.run_utils import tritonbench_run
 
+        run_timestamp, output_dir = setup_output_dir(
+            bm_name="timing_accuracy", output_dir=args.output_dir
+        )
+        # override output_dir in ci mode
+        args.output_dir = output_dir
         os.environ["TRITONBENCH_RUN_CONFIG"] = os.path.join(CURRENT_DIR, "ci.yaml")
+        extra_args.extend(["--output-dir", str(output_dir.absolute())])
         tritonbench_run(args=extra_args, disable_sys_argv=True)
-        return
+    else:
+        tb_parser = get_parser()
 
-    tb_parser = get_parser()
+        tb_args, extra_args = tb_parser.parse_known_args(extra_args)
+        if args.dump_json and not args.output_dir:
+            run_timestamp, output_dir = setup_output_dir(bm_name="timing_accuracy")
+            args.output_dir = output_dir
+        else:
+            run_timestamp = None
+        _run(args, tb_args, extra_args, args.output_dir)
 
-    tb_args, extra_args = tb_parser.parse_known_args(extra_args)
-    _run(args, tb_args, extra_args)
+    # finished running all configs. now reduce output metrics to a single file
+    if run_timestamp and args.output_dir:
+        benchmark_data = aggregate_outputs(
+            "timing_accuracy", run_timestamp, args.output_dir, args.ci
+        )
+        if args.log_scuba:
+            log_benchmark(benchmark_data)
 
 
 if __name__ == "__main__":

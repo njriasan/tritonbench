@@ -1,4 +1,4 @@
-common_args: --launch benchmarks.timing_accuracy.run --output-dir .benchmarks/timing_accuracy/run-${timestamp}
+common_args: --launch benchmarks.timing_accuracy.run
 fp16_addmm_triton_addmm_fwd:
   args: --op addmm --only triton_addmm
 fp16_addmm_triton_addmm_bwd:
