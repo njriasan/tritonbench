@@ -333,6 +333,8 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                 },
                 num_stages=s,
                 num_warps=w,
+                early_tma_store_lowering=1,
+                maxRegAutoWS=255,
                 pre_hook=pre_hook,
             )  #
             for BM in bm_range  #
