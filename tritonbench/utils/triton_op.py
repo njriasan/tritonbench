@@ -105,6 +105,7 @@ BASELINE_SKIP_METRICS = {
     "speedup",
     "accuracy",
     "cosine_similarity",
+    "snr",
     "determinism",
     "mem_footprint_compression_ratio",
     "nsys_gpu_speedup",
@@ -235,6 +236,8 @@ class BenchmarkOperatorMetrics:
     accuracy: Optional[bool] = None
     # cosine similarity to baseline output (1.0 = identical direction)
     cosine_similarity: Optional[float] = None
+    # signal-to-noise ratio compared to baseline (higher is better)
+    snr: Optional[float] = None
     # determinism check result (independent of accuracy)
     determinism: Optional[DeterminismResult] = None
     # wall time
@@ -750,6 +753,11 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     ):
         set_env()
         set_random_seed()
+        # Set Triton autotune env vars before any kernels are invoked
+        if tb_args.autotune_warmup is not None:
+            os.environ["TRITON_AUTOTUNE_WARMUP_MS"] = str(tb_args.autotune_warmup)
+        if tb_args.autotune_rep is not None:
+            os.environ["TRITON_AUTOTUNE_REP_MS"] = str(tb_args.autotune_rep)
         if tb_args.plugin:
             load_plugin(tb_args.plugin)
         if extra_args and not tb_args:
@@ -1120,6 +1128,13 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                         only_benchmarks = list(
                             dict.fromkeys(self._only)
                         )  # remove duplicates while preserving order
+                        # append baseline if it is not in the list of only_benchmarks yet
+                        if (
+                            set(self.required_metrics) & BASELINE_SKIP_METRICS
+                            and self.name in BASELINE_BENCHMARKS
+                            and BASELINE_BENCHMARKS[self.name] not in only_benchmarks
+                        ):
+                            only_benchmarks.append(BASELINE_BENCHMARKS[self.name])
                         enabled_benchmarks = find_enabled_benchmarks(
                             self.mode, REGISTERED_BENCHMARKS[self.name], []
                         )
@@ -1302,9 +1317,29 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         return None
 
     def plot(self):
-        """Plot the comparison between different operator implementations."""
-        raise NotImplementedError(
-            "Each operator must implement its own plotting logic."
+        """
+        Plot the comparison between different operator implementations.
+
+        This default implementation uses the generic plot_benchmark_results
+        utility which dynamically discovers providers from benchmark results
+        and creates a bar chart comparing TFLOPS across providers.
+
+        Operators can override this method to provide custom plotting logic
+        with operator-specific title maps, x-axis formatting, etc.
+        """
+        if "tflops" not in self.required_metrics:
+            print(
+                f"Skipping plot for {self.name}: 'tflops' metric not available. "
+                "Override plot() method for custom plotting."
+            )
+            return
+
+        from tritonbench.utils.plot_utils import plot_benchmark_results
+
+        plot_benchmark_results(
+            output=self.output,
+            tb_args=self.tb_args,
+            op_name=self.name,
         )
 
     def best_config(self, fn):
@@ -1638,6 +1673,22 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             return DeterminismResult.FAIL
 
     def accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
+        # Poison the CUDA caching allocator to detect stale memory reuse.
+        # Without this, torch.empty() may return memory from a previous
+        # call that contains correct results, masking correctness bugs.
+        # We call fn() to get an output, fill it with NaN in-place, then
+        # call fn() again. If fn() reuses the same memory block without
+        # fully writing it, the NaN values will remain and fail the check.
+        _probe = fn()
+
+        def _poison(t):
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                if not (t.is_leaf and t.requires_grad):
+                    t.data.fill_(float("nan"))
+            return t
+
+        tree_map(_poison, _probe)
+        del _probe
         try:
             if self.mode == Mode.FWD:
                 output = fn()
@@ -1762,6 +1813,42 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             logger.warning(f"Exception during cosine similarity computation: {e}")
             return 0.0
 
+    def snr(self, fn: Callable, baseline_fn: Callable) -> float:
+        """
+        Compute Signal-to-Noise Ratio (SNR) between the output of fn and baseline_fn.
+        SNR = 10 * log10(signal_power / noise_power)
+        where signal is the baseline output and noise is the difference (error).
+        Returns SNR in decibels (dB). Higher values indicate closer match.
+        """
+        try:
+            output = fn()
+            baseline_output = baseline_fn()
+
+            if isinstance(output, torch.Tensor) and isinstance(
+                baseline_output, torch.Tensor
+            ):
+                output_flat = output.flatten().float()
+                baseline_flat = baseline_output.flatten().float()
+
+                # Compute signal power (baseline) and noise power (error)
+                signal_power = torch.mean(baseline_flat**2)
+                noise = output_flat - baseline_flat
+                noise_power = torch.mean(noise**2)
+
+                if noise_power == 0:
+                    return float("inf")
+                if signal_power == 0:
+                    return float("-inf")
+
+                snr_db = 10 * torch.log10(signal_power / noise_power)
+                return snr_db.item()
+            else:
+                logger.warning("SNR only supported for tensor outputs")
+                return 0.0
+        except Exception as e:
+            logger.warning(f"Exception during SNR computation: {e}")
+            return 0.0
+
     def _do_bench(
         self,
         input_id: int,
@@ -1879,6 +1966,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     self.cosine_similarity(fn, self.baseline_fn)
                     if self.baseline_fn
                     else None
+                )
+            if not baseline and "snr" in self.required_metrics:
+                metrics.snr = (
+                    self.snr(fn, self.baseline_fn) if self.baseline_fn else None
                 )
             if "hw_roofline" in self.required_metrics:
                 metrics.hw_roofline = self.hw_roofline()
@@ -2306,6 +2397,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             "--nvtx-include",
             # it is for range_start and range_end. no ending /.
             f"{_RANGE_NAME}",
+            "--pm-sampling-max-passes",
+            "4",
+            "--warp-sampling-max-passes",
+            "4",
             "--target-processes",
             "all",
             "--import-source",

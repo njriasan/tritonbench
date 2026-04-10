@@ -6,10 +6,18 @@ then launches tritonbench with the generated config.
 
 Example config file format (YAML):
 ```yaml
-run_config:
-  with_backwards: true
-  tags:
-    - triton
+run_configs:
+  perf:
+    with_backwards: true
+    tags:
+      - triton
+    metrics:
+      - latency
+  compile_time:
+    tags:
+      - triton
+    metrics:
+      - compile_time
 ```
 
 Usage:
@@ -80,17 +88,22 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         help="Maximum number of configs to generate.",
     )
+    parser.add_argument(
+        "--attach-launch",
+        action="store_true",
+        help="Attach launch argument in common_args.",
+    )
 
     parsed_args, extra_args = parser.parse_known_args(args)
     parsed_args.extra_args = extra_args
     return parsed_args
 
 
-def load_config(config_file: str) -> Dict[str, Any]:
+def load_config(config_file: str, base_dir=CURRENT_DIR) -> Dict[str, Any]:
     """Load and parse the YAML config file."""
     config_path = Path(config_file)
     if not config_path.exists():
-        config_path = Path(CURRENT_DIR).joinpath(config_file)
+        config_path = Path(base_dir).joinpath(config_file)
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_file}")
 
@@ -106,6 +119,7 @@ def generate_run_config(
     extra_args: List[str],
     separate_backends: bool = False,
     num_configs: Optional[int] = None,
+    attach_launch: bool = False,
 ) -> Dict[str, Any]:
     """
     Generate a TRITONBENCH_RUN_CONFIG file from the sweep runner config and target.
@@ -119,18 +133,42 @@ def generate_run_config(
     Returns:
         A dictionary in TRITONBENCH_RUN_CONFIG format
     """
-    run_config = get_benchmark_config_with_tags(
-        tags=sweep_runner_config["run_config"]["tags"],
-        per_backend=separate_backends,
-    )
     result_configs = {}
-    for cid, c in enumerate(run_config):
-        if num_configs is not None and cid >= num_configs:
-            break
-        per_config_args = ["--launch", f"benchmarks.{target}.run"]
-        per_config_args.extend(extra_args)
-        run_config[c]["args"] += " " + " ".join(per_config_args)
-        result_configs[c] = run_config[c].copy()
+    if attach_launch:
+        result_configs["common_args"] = f"--launch benchmarks.{target}.run"
+    if extra_args:
+        if "common_args" not in result_configs:
+            result_configs["common_args"] = ""
+        if len(result_configs["common_args"]):
+            result_configs["common_args"] += " "
+        result_configs["common_args"] += " ".join(extra_args)
+
+    disabled_benchmarks = sweep_runner_config.get("disabled", {})
+    override_benchmarks = sweep_runner_config.get("overrides", {})
+
+    config_count = 0
+    for _run_config_name, run_config_value in sweep_runner_config["run_configs"].items():
+        if skip_tests := run_config_value.get("skip_tests", None):
+            skip_tests = [
+                load_config(skip_test, base_dir=REPO_PATH) for skip_test in skip_tests
+            ]
+        run_config = get_benchmark_config_with_tags(
+            tags=run_config_value["tags"],
+            per_backend=separate_backends,
+            with_backwards=run_config_value.get("with_backwards", False),
+            metrics=run_config_value.get("metrics", None),
+            skip_tests=skip_tests,
+        )
+        for c in run_config:
+            if num_configs is not None and config_count >= num_configs:
+                break
+            if c in disabled_benchmarks:
+                continue
+            if c in override_benchmarks:
+                result_configs[c] = override_benchmarks[c].copy()
+            else:
+                result_configs[c] = run_config[c].copy()
+            config_count += 1
     return result_configs
 
 
@@ -145,7 +183,7 @@ def run(args: Optional[List[str]] = None) -> None:
     parsed_args = parse_args(args)
 
     if not parsed_args.sweep_output_file:
-        default_output_name = f"sweep_{parsed_args.target}.yaml"
+        default_output_name = f"sweep_{parsed_args.sweep_target}.yaml"
         timestamp, output_dir = setup_output_dir(bm_name=parsed_args.target)
         parsed_args.sweep_output_file = output_dir.join(default_output_name)
 
@@ -155,6 +193,7 @@ def run(args: Optional[List[str]] = None) -> None:
         extra_args=parsed_args.extra_args,
         separate_backends=parsed_args.separate_backends,
         num_configs=parsed_args.sweep_num_configs,
+        attach_launch=parsed_args.attach_launch,
     )
 
     write_run_config(run_config, parsed_args.sweep_output_file)

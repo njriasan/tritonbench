@@ -1,11 +1,14 @@
 import logging
 import os
 import unittest
-from typing import Dict, List
+from typing import List
 
 import yaml
 from tritonbench.operators import (  # @manual=//pytorch/tritonbench:tritonbench
     load_opbench_by_name,
+)
+from tritonbench.operators.op_task import (  # @manual=//pytorch/tritonbench:tritonbench
+    OpTask,
 )
 from tritonbench.operators_collection import (
     list_operators_by_collection,  # @manual=//pytorch/tritonbench:tritonbench
@@ -13,32 +16,19 @@ from tritonbench.operators_collection import (
 from tritonbench.utils.env_utils import (
     is_blackwell,  # @manual=//pytorch/tritonbench:tritonbench
     is_fbcode,  # @manual=//pytorch/tritonbench:tritonbench
-    is_hip,  # @manual=//pytorch/tritonbench:tritonbench
 )
 from tritonbench.utils.parser import get_parser
+from tritonbench.utils.run_utils import _env_check
 
 if is_fbcode():
     import importlib
 
-    # Use B200-specific skip file on Blackwell GPUs
-    if is_blackwell():
-        fbcode_skip_file_path = "fb/skip_tests_b200_fbcode.yaml"
-    else:
-        fbcode_skip_file_path = "fb/skip_tests_h100_fbcode.yaml"
+    fbcode_skip_file_path = "fb/skip_tests.yaml"
     SKIP_FILE = importlib.resources.files(__package__).joinpath(fbcode_skip_file_path)
 else:
-    import triton  # @manual
-
-    if "site-packages" in triton.__file__:
-        SKIP_FILE_NAME = "skip_tests_h100_pytorch.yaml"
-    else:
-        SKIP_FILE_NAME = (
-            "skip_tests_mi350_triton_main.yaml"
-            if is_hip()
-            else "skip_tests_h100_triton_main.yaml"
-        )
-
-    SKIP_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), SKIP_FILE_NAME))
+    SKIP_FILE = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "skip_tests.yaml")
+    )
 
 with open(SKIP_FILE, "r") as f:
     skip_tests = yaml.safe_load(f)
@@ -46,22 +36,41 @@ with open(SKIP_FILE, "r") as f:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Ops that we run forward only
-FWD_ONLY_OPS = skip_tests.get("fwd_only_ops", [])
-# Ops that require special arguments in backwards
-BWD_ARGS_OPS: Dict[str, List[str]] = skip_tests.get("bwd_args", {})
-# B200-only ops: if specified, only run these ops (skip all others)
-B200_ONLY_OPS = skip_tests.get("b200_only_ops", [])
-
 TEST_OPERATORS = (
     set(list_operators_by_collection(op_collection="buck"))
     if is_fbcode()
     else set(list_operators_by_collection(op_collection="default"))
 )
 
-# On B200, filter to only run B200-only operators if specified
-if is_fbcode() and is_blackwell() and B200_ONLY_OPS:
-    TEST_OPERATORS = set(B200_ONLY_OPS) & TEST_OPERATORS
+
+def _gen_test_operators(test_ops, skip_tests) -> set[str]:
+    # to save capacity, only run tests specific to b200 on b200
+    if is_blackwell():
+        test_ops = {
+            test_op: {"disabled": False}
+            for test_op in skip_tests
+            if skip_tests[test_op]
+            and "devices" in skip_tests[test_op]
+            and "b200" in skip_tests[test_op]["devices"]
+        }
+    else:
+        test_ops = {test_op: {"disabled": False} for test_op in test_ops}
+    for skip_op in skip_tests:
+        if not skip_op in test_ops:
+            continue
+        # remove operators that are unconditionally bypassed on CI
+        # ususally CI environment issue or broken operators need to be fixed
+        if skip_tests[skip_op] == None:
+            test_ops[skip_op]["disabled"] = True
+            continue
+        for field_name in ["devices", "channels"]:
+            test_ops[skip_op]["disabled"] = test_ops[skip_op][
+                "disabled"
+            ] or not _env_check(skip_tests[skip_op], field_name)
+    return {test_op for test_op in test_ops if not test_ops[test_op]["disabled"]}
+
+
+TEST_OPERATORS = _gen_test_operators(TEST_OPERATORS, skip_tests)
 
 
 def check_ci_output(op):
@@ -82,59 +91,58 @@ def check_ci_output(op):
     )
 
 
-def _run_one_operator(args: List[str]):
-    parser = get_parser(args)
-    tb_args, extra_args = parser.parse_known_args(args)
-    if tb_args.op in skip_tests:
-        # If the op itself is in the skip list, skip all tests
-        if not skip_tests[tb_args.op]:
-            return
-        tb_args.skip = ",".join(skip_tests[tb_args.op])
-    Operator = load_opbench_by_name(tb_args.op)
-
-    op = Operator(tb_args=tb_args, extra_args=extra_args)
-    op.run()
-    check_ci_output(op)
-    # Test backward (if applicable)
-    if tb_args.op in FWD_ONLY_OPS:
-        return
-    if op.has_bwd():
-        del op
-        if tb_args.op in BWD_ARGS_OPS:
-            args.extend(BWD_ARGS_OPS[tb_args.op])
+class MaybeTestOperatorTask:
+    def __init__(self, op: str, args: List[str], in_task: bool = False):
+        if in_task:
+            self.in_task = True
+            task = OpTask(op)
+            task.make_operator_instance(args=args)
+            self.op = task
+        else:
+            self.in_task = False
+            Operator = load_opbench_by_name(op)
+            parser = get_parser(args)
             tb_args, extra_args = parser.parse_known_args(args)
-        tb_args.mode = "bwd"
-        op = Operator(tb_args=tb_args, extra_args=extra_args)
-        op.run()
-        check_ci_output(op)
+            self.op = Operator(tb_args=tb_args, extra_args=extra_args)
+
+    def check_output(self):
+        if not self.in_task:
+            check_ci_output(self.op)
+        else:
+            self.op.check_output()
+
+    def run(self):
+        self.op.run()
+
+    def has_bwd(self):
+        return self.op.has_bwd()
 
 
-def _run_operator_in_task(op: str, args: List[str]):
-    from tritonbench.operators.op_task import (  # @manual=//pytorch/tritonbench:tritonbench
-        OpTask,
+def _run_one_operator(op: str, args: List[str], in_task: bool = False):
+    extra_args_from_skip_files = (
+        skip_tests[op]["extra_args"].split(" ")
+        if skip_tests.get(op, None) and skip_tests[op].get("extra_args", None)
+        else []
     )
+    args.extend(extra_args_from_skip_files)
+    opbench = MaybeTestOperatorTask(op, args, in_task)
+    opbench.run()
+    opbench.check_output()
 
-    if op in skip_tests:
-        # If the op itself is in the skip list, skip all tests
-        if not skip_tests[op]:
-            return
-        skip = ",".join(skip_tests[op])
-        args.extend(["--skip", skip])
-    task = OpTask(op)
-    task.make_operator_instance(args=args)
-    task.run()
-    task.check_output()
     # Test backward (if applicable)
-    if op in FWD_ONLY_OPS:
-        return
-    if task.get_attribute("has_bwd", method=True):
-        task.del_op_instance()
+    if opbench.has_bwd():
+        del opbench
+        extra_bwd_args = (
+            skip_tests[op]["extra_bwd_args"].split(" ")
+            if skip_tests.get(op, None) and skip_tests[op].get("extra_bwd_args", None)
+            else []
+        )
+        if extra_bwd_args:
+            args.extend(extra_bwd_args)
         args.extend(["--bwd"])
-        if op in BWD_ARGS_OPS:
-            args.extend(BWD_ARGS_OPS[op])
-        task.make_operator_instance(args=args)
-        task.run()
-        task.check_output()
+        opbench = MaybeTestOperatorTask(op, args, in_task)
+        opbench.run()
+        opbench.check_output()
 
 
 def make_test(operator):
@@ -149,10 +157,8 @@ def make_test(operator):
             "1",
             "--test-only",
         ]
-        if is_fbcode():
-            _run_one_operator(args)
-        else:
-            _run_operator_in_task(op=operator, args=args)
+        in_task = not is_fbcode()
+        _run_one_operator(op=operator, args=args, in_task=in_task)
 
     return test_case
 

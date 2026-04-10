@@ -1,6 +1,0 @@
-packaging
-nvidia-ml-py
-psutil
-tabulate
-matplotlib
-transformers==4.53.0

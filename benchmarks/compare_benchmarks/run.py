@@ -9,6 +9,7 @@ Assumes 1 GPU type (e.g. H100, MI350). GPU type defined by torchx job.
 """
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -71,14 +72,65 @@ def build_op_args(
     return args
 
 
-def get_input_loader(gpu: str, workloads: List[str], op: str) -> List[tuple[str, str]]:
+def _check_input_config(
+    file_path: Path, op: str, gpu: str
+) -> tuple[bool, Optional[str]]:
+    """
+    Check if a JSON input config file matches the given op and GPU.
+
+    For op matching: checks metadata.tritonbench_ops first, then falls back
+    to checking if the op exists as a top-level key in the JSON.
+
+    For GPU matching: if metadata.gpus is present, the file is only valid
+    for those GPUs. If absent, the file is valid for all GPUs.
+
+    Returns:
+        (matches, skip_reason): matches is True if the file should be used,
+        skip_reason is a message if skipped due to GPU filtering (None otherwise).
+    """
+    try:
+        with open(file_path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False, None
+
+    metadata = data.get("metadata", {})
+
+    # Check op match
+    tritonbench_ops = metadata.get("tritonbench_ops")
+    if tritonbench_ops:
+        if op not in tritonbench_ops:
+            return False, None
+    elif op not in data:
+        return False, None
+
+    # Check GPU match
+    gpu_list = metadata.get("gpus")
+    if gpu_list and gpu.lower() not in [g.lower() for g in gpu_list]:
+        return False, f"GPU {gpu} not in metadata.gpus"
+
+    return True, None
+
+
+def get_input_loader(
+    gpu: str,
+    workloads: List[str],
+    op: str,
+    input_filter: Optional[str] = None,
+) -> List[tuple[str, str]]:
     """
     Get input loader paths for the given GPU type and workloads.
+
+    Supports two directory layouts:
+    1. Convention-based: {workload}/{gpu}/shapes_{op}.json
+    2. Flat (metadata-driven): {workload}/*.json with metadata.tritonbench_ops
+       or the op as a top-level key. Optional metadata.gpus for GPU filtering.
 
     Args:
         gpu: GPU type (e.g., "H100", "MI350") - will be lowercased
         workloads: List of workload names (e.g., ["cmf", "omnifm_v4"]).
         op: Operator name to find shape files for (e.g., "gemm", "addmm")
+        input_filter: Optional substring filter on input config filenames.
 
     Returns:
         List of (workload, input_loader_path) tuples
@@ -94,23 +146,48 @@ def get_input_loader(gpu: str, workloads: List[str], op: str) -> List[tuple[str,
     input_loaders: List[tuple[str, str]] = []
 
     for workload in workloads:
-        workload_dir = input_configs_dir / workload / gpu_lower
+        workload_dir = input_configs_dir / workload
+        gpu_subdir = workload_dir / gpu_lower
 
-        if not workload_dir.exists():
-            print(
-                f"[Compare Benchmarks] WARNING: No eval shapes for workload={workload}, gpu={gpu_lower}"
-            )
-            continue
-
-        op_pattern = f"shapes_{op}.json" if op != "gemm" else "shapes_mm.json"
-        shape_file = workload_dir / op_pattern
-        if shape_file.exists():
-            relative_path = f"fb/{workload}/{gpu_lower}/{op_pattern}"
-            input_loaders.append((workload, relative_path))
-            print(f"[Compare Benchmarks] Found input config: {relative_path}")
+        if gpu_subdir.exists() and gpu_subdir.is_dir():
+            # Convention-based: {workload}/{gpu}/shapes_{op}.json
+            op_pattern = f"shapes_{op}.json" if op != "gemm" else "shapes_mm.json"
+            shape_file = gpu_subdir / op_pattern
+            if shape_file.exists():
+                relative_path = f"fb/{workload}/{gpu_lower}/{op_pattern}"
+                input_loaders.append((workload, relative_path))
+                print(f"[Compare Benchmarks] Found input config: {relative_path}")
+            else:
+                print(
+                    f"[Compare Benchmarks] WARNING: No shape file {op_pattern} for op={op} in {workload}/{gpu_lower}"
+                )
+        elif workload_dir.exists():
+            # Flat (metadata-driven): scan .json files in the workload dir
+            found = False
+            for json_file in sorted(workload_dir.glob("*.json")):
+                if input_filter and input_filter not in json_file.name:
+                    print(
+                        f"[Compare Benchmarks] Skipping {json_file.name}: does not match --input-filter '{input_filter}'"
+                    )
+                    continue
+                matches, skip_reason = _check_input_config(json_file, op, gpu_lower)
+                if not matches:
+                    if skip_reason:
+                        print(
+                            f"[Compare Benchmarks] Skipping {json_file.name}: {skip_reason}"
+                        )
+                    continue
+                relative_path = f"fb/{workload}/{json_file.name}"
+                input_loaders.append((workload, relative_path))
+                print(f"[Compare Benchmarks] Found input config: {relative_path}")
+                found = True
+            if not found:
+                print(
+                    f"[Compare Benchmarks] WARNING: No matching input configs for op={op}, gpu={gpu_lower} in {workload}/"
+                )
         else:
             print(
-                f"[Compare Benchmarks] WARNING: No shape file {op_pattern} for op={op} in {workload}/{gpu_lower}"
+                f"[Compare Benchmarks] WARNING: No eval shapes for workload={workload}"
             )
 
     return input_loaders
@@ -246,7 +323,7 @@ def run_benchmarks(config: BenchmarkConfig) -> None:
                 continue
 
             lhs_benchmark, rhs_benchmark = config.benchmark_map[op]
-            input_loaders = get_input_loader(gpu, config.workloads, op)
+            input_loaders = get_input_loader(gpu, config.workloads, op, config.input_filter)
 
             if not input_loaders:
                 print(
@@ -342,6 +419,12 @@ def parse_args(args: List[str] = None) -> BenchmarkConfig:
         help=f"Comma-separated list of workloads representing shapes to evaluate. Default: {','.join(DEFAULT_WORKLOADS)}",
     )
     parser.add_argument(
+        "--input-filter",
+        type=str,
+        default=None,
+        help="Substring filter on input config filenames (if searching a workload directory without explicit GPU subdirectories). Only files whose name contains this string will be used.",
+    )
+    parser.add_argument(
         "--benchmarks-lhs",
         type=str,
         default=None,
@@ -401,6 +484,7 @@ def parse_args(args: List[str] = None) -> BenchmarkConfig:
         "ops": args.ops.split(","),
         "metrics": args.metrics.split(","),
         "workloads": workloads,
+        "input_filter": args.input_filter,
         "parse_autotune_logs": args.parse_autotune_logs,
         "log_scuba": args.log_scuba,
         "scuba_eval_id": args.scuba_eval_id,

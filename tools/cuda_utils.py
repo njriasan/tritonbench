@@ -6,10 +6,11 @@ import subprocess
 from pathlib import Path
 
 from .torch_utils import install_pytorch_nightly
+from .python_utils import get_pip_cmd, USE_UV
 
 # defines the default CUDA version to compile against
-DEFAULT_CUDA_VERSION = "12.8"
-DEFAULT_HIP_VERSION = "7.0"
+DEFAULT_CUDA_VERSION = "13.0"
+DEFAULT_HIP_VERSION = "7.2"
 
 # the key is the value of `torch.version.cuda`
 CUDA_VERSION_MAP = {
@@ -25,8 +26,8 @@ CUDA_VERSION_MAP = {
 
 # the key is the value of `torch.version.hip`
 HIP_VERSION_MAP = {
-    "7.0": {
-        "pytorch_url": "rocm7.0",
+    "7.2": {
+        "pytorch_url": "rocm7.2",
     }
 }
 
@@ -94,24 +95,19 @@ def setup_cuda_softlink(cuda_version: str):
 
 
 def install_torch_deps():
-    # install other dependencies
+    # install torch dependencies
     torch_deps = [
-        "requests",
-        "ninja",
-        "pyyaml",
-        "setuptools",
-        "gitpython",
-        "beautifulsoup4",
-        "regex",
+        "packaging",
     ]
-    cmd = ["conda", "install", "-y"] + torch_deps
+    cmd = get_pip_cmd() + ["install"] + torch_deps
     subprocess.check_call(cmd)
     # conda forge deps
     # ubuntu 22.04 comes with libstdcxx6 12.3.0
     # we need to install the same library version in conda
-    conda_deps = ["libstdcxx-ng=12.3.0"]
-    cmd = ["conda", "install", "-y", "-c", "conda-forge"] + conda_deps
-    subprocess.check_call(cmd)
+    if not USE_UV:
+        conda_deps = ["libstdcxx-ng=12.3.0"]
+        cmd = ["conda", "install", "-y", "-c", "conda-forge"] + conda_deps
+        subprocess.check_call(cmd)
 
 
 def get_toolkit_version_from_torch(key="pytorch_url") -> str:

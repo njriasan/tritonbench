@@ -1,0 +1,20 @@
+# Run config file for nightly benchmark
+# First, collect all ops and backends with tags "triton"
+# Measure latency, flops, and speedup metrics in the best effort
+# Some operators might not support flops or speedup metrics
+run_configs:
+  default:
+    with_backwards: true
+    tags:
+      - triton
+    metrics:
+      - latency
+      - flops
+      - speedup
+    skip_tests:
+      - test/test_gpu/skip_tests.yaml
+# override some ops
+# launch_latency_fwd: measure walltime instead of latency
+overrides:
+  launch_latency_fwd:
+    args: --op launch_latency --metrics walltime

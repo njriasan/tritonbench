@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import triton
 
-from ..common import setup_output_dir, setup_tritonbench_cwd
+from ..common import setup_tritonbench_cwd, run_benchmark_config_ci
 
 setup_tritonbench_cwd()
 
@@ -19,6 +19,8 @@ from tritonbench.utils.parser import get_parser
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 @dataclass
@@ -76,29 +78,35 @@ class MethodStats:
             "n_tests": self.n_tests,
             "warmup": self.warmup,
             "rep": self.rep,
+            "benchmark_time_s": self.benchmark_time,
             "intra_test": {
-                "avg_median_ms": statistics.mean(self.intra_test_medians)
-                if self.intra_test_medians
-                else 0,
-                "avg_std_ms": statistics.mean(self.intra_test_stds)
-                if self.intra_test_stds
-                else 0,
+                "avg_median_ms": (
+                    statistics.mean(self.intra_test_medians)
+                    if self.intra_test_medians
+                    else 0
+                ),
+                "avg_std_ms": (
+                    statistics.mean(self.intra_test_stds) if self.intra_test_stds else 0
+                ),
                 "avg_cv": self.avg_intra_test_cv,
-                "avg_min_ms": statistics.mean(self.intra_test_mins)
-                if self.intra_test_mins
-                else 0,
-                "avg_max_ms": statistics.mean(self.intra_test_maxs)
-                if self.intra_test_maxs
-                else 0,
+                "avg_min_ms": (
+                    statistics.mean(self.intra_test_mins) if self.intra_test_mins else 0
+                ),
+                "avg_max_ms": (
+                    statistics.mean(self.intra_test_maxs) if self.intra_test_maxs else 0
+                ),
             },
             "inter_test": {
                 "median_ms": self.inter_test_median,
                 "std_ms": self.inter_test_std,
                 "cv": self.inter_test_cv,
+                "min_ms": self.inter_test_min,
             },
             "intra_test_medians": self.intra_test_medians,
             "intra_test_stds": self.intra_test_stds,
             "intra_test_cvs": self.intra_test_cvs,
+            "intra_test_mins": self.intra_test_mins,
+            "intra_test_maxs": self.intra_test_maxs,
             "all_samples": self.all_samples,
         }
 
@@ -162,9 +170,9 @@ def run_do_bench_gpu_events(fn: Callable, warmup: int, rep: int) -> List[float]:
 
 
 BENCHMARK_METHODS = {
-    "standard": ("triton do_bench (standard)", run_do_bench_standard),
+    "triton_do_bench": ("triton do_bench (standard)", run_do_bench_standard),
     "profiler": ("profiler", run_do_bench_profiler),
-    "cudagraph": ("CUDA graph", run_do_bench_cudagraph),
+    "triton_do_bench_cudagraph": ("Triton do_bench CUDA graph", run_do_bench_cudagraph),
     "entropy": ("entropy-based", run_do_bench_entropy),
     "profiler_cudagraph": ("profiler + CUDA graph", run_do_bench_profiler_cudagraph),
     "gpu_events": ("GPU events", run_do_bench_gpu_events),
@@ -258,12 +266,19 @@ def print_summary_table(results: Dict[str, MethodStats], operation_name: str):
     )
 
 
-def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List[str]):
+def _run(
+    args: argparse.Namespace,
+    tb_args: argparse.Namespace,
+    extra_args: List[str],
+):
     device_name = torch.cuda.get_device_name()
     logger.info(f"Loading operator: {tb_args.op}")
 
     # Use existing tritonbench infrastructure to load operator
     from tritonbench.utils.run_utils import load_operator_by_args
+    from tritonbench.utils.triton_op import _translate_mode
+
+    _translate_mode(tb_args)
 
     tb_arg_list = [
         "--op",
@@ -284,6 +299,7 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
     tb_arg_list.extend(extra_args)
 
     opbench = load_operator_by_args(tb_arg_list)
+    tb_args = opbench.tb_args
     opbench.example_inputs = opbench.get_example_inputs()
 
     if opbench.example_inputs is None:
@@ -315,10 +331,10 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
         kernel_fn = bench_fn_factory(*example_inputs)
 
     operation_name = (
-        f"{tb_args.op}_{tb_args.mode}:{backend_name} (input_id={tb_args.input_id})"
+        f"{tb_args.op}_{tb_args.mode}:{backend_name}_input_id={tb_args.input_id}"
     )
     logger.info(
-        f"[timing_accuracy] Device: {device_name}, Op: {tb_args.op}, Backend: {backend_name}, Tests: {args.n_tests}, Warmup: {tb_args.warmup}, Reps: {tb_args.rep}\n"
+        f"[timing_accuracy] Device: {device_name}, Op: {tb_args.op}, Mode: {tb_args.mode}, Backend: {backend_name}, Tests: {args.n_tests}, Warmup: {tb_args.warmup}, Reps: {tb_args.rep}\n"
     )
 
     # Determine methods to run
@@ -340,7 +356,7 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
         logger.info(f"\n{'=' * 60}\nBenchmarking: {method_display_name}\n{'=' * 60}")
 
         stats = benchmark_method(
-            method_name=method_display_name,
+            method_name=method_key,
             method_fn=method_fn,
             kernel_fn=kernel_fn,
             n_tests=args.n_tests,
@@ -353,27 +369,72 @@ def _run(args: argparse.Namespace, tb_args: argparse.Namespace, extra_args: List
 
     print_summary_table(results, operation_name)
 
-    if args.dump_json or args.output:
-        if not args.output:
-            timestamp, output_dir = setup_output_dir(bm_name="timing_accuracy")
-            args.output = os.path.join(output_dir, f"{operation_name}.json")
-        output_data = {
-            "config": {
-                "device": device_name,
-                "operator": tb_args.op,
-                "backend": backend_name,
-                "input_id": tb_args.input_id,
-                "mode": tb_args.mode,
-                "precision": tb_args.precision,
-                "n_tests": args.n_tests,
-                "rep": tb_args.rep,
-                "warmup": tb_args.warmup,
-            },
-            "results": {name: stats.to_dict() for name, stats in results.items()},
-        }
-        with open(args.output, "w") as f:
-            json.dump(output_data, f, indent=2)
-        logger.info(f"Results saved to: {args.output}")
+    if not args.output_json:
+        return
+
+    output_data = {
+        "config": {
+            "device": device_name,
+            "operator": tb_args.op,
+            "backend": backend_name,
+            "input_id": tb_args.input_id,
+            "mode": tb_args.mode,
+            "precision": tb_args.precision,
+            "n_tests": args.n_tests,
+            "rep": tb_args.rep,
+            "warmup": tb_args.warmup,
+        },
+        "results": {name: stats.to_dict() for name, stats in results.items()},
+    }
+    with open(args.output_json, "w") as f:
+        json.dump(output_data, f, indent=2)
+    logger.info(f"Results saved to: {args.output_json}")
+
+
+def transform_single_result(result) -> Dict[str, Any]:
+    out = {}
+    op_name = result["config"]["operator"]
+    mode = result["config"]["mode"]
+    backend = result["config"]["backend"]
+    input_id = result["config"]["input_id"]
+    prefix = f"tritonbench_{op_name}_{mode}[x_{input_id}-{backend}]_"
+    out[f"{prefix}precision"] = result["config"]["precision"]
+    out[f"{prefix}warmup"] = result["config"]["warmup"]
+    out[f"{prefix}ntests"] = result["config"]["n_tests"]
+    out[f"{prefix}rep"] = result["config"]["rep"]
+    for method_name, method_stats in result["results"].items():
+        method_key = method_stats["method_name"]
+        out[f"{prefix}{method_key}-benchmark_time_s"] = method_stats[
+            "benchmark_time_s"
+        ]
+        out[f"{prefix}{method_key}-intra_test_avg_median_ms"] = method_stats[
+            "intra_test"
+        ]["avg_median_ms"]
+        out[f"{prefix}{method_key}-intra_test_avg_std_ms"] = method_stats[
+            "intra_test"
+        ]["avg_std_ms"]
+        out[f"{prefix}{method_key}-intra_test_avg_cv"] = method_stats["intra_test"][
+            "avg_cv"
+        ]
+        out[f"{prefix}{method_key}-intra_test_avg_min_ms"] = method_stats[
+            "intra_test"
+        ]["avg_min_ms"]
+        out[f"{prefix}{method_key}-intra_test_avg_max_ms"] = method_stats[
+            "intra_test"
+        ]["avg_max_ms"]
+        out[f"{prefix}{method_key}-inter_test_median_ms"] = method_stats[
+            "inter_test"
+        ]["median_ms"]
+        out[f"{prefix}{method_key}-inter_test_std_ms"] = method_stats["inter_test"][
+            "std_ms"
+        ]
+        out[f"{prefix}{method_key}-inter_test_cv"] = method_stats["inter_test"][
+            "cv"
+        ]
+        out[f"{prefix}{method_key}-inter_test_min_ms"] = method_stats["inter_test"][
+            "min_ms"
+        ]
+    return out
 
 
 def run(args: Optional[List[str]] = None):
@@ -397,18 +458,42 @@ def run(args: Optional[List[str]] = None):
     parser.add_argument(
         "--dump-json", action="store_true", help="Output results as JSON"
     )
-    parser.add_argument("--output", type=str, default=None, help="Output JSON path")
+    parser.add_argument(
+        "--ci", action="store_true", help="Run in CI mode (run all tests in ci.yaml)"
+    )
+    parser.add_argument(
+        "--test-op", type=str, help="(CI mode only) Only run specific op in ci."
+    )
+    parser.add_argument(
+        "--log-scuba",
+        action="store_true",
+        help="Log results to Scuba",
+    )
+    parser.add_argument("--output-json", type=str, default=None, help="Output JSON file")
     parser.add_argument("--quiet", action="store_true")
 
     if not torch.cuda.is_available():
         print("ERROR: CUDA is not available!")
         sys.exit(1)
 
-    tb_parser = get_parser()
     args, extra_args = parser.parse_known_args(args)
+
+    if args.ci:
+        run_benchmark_config_ci(
+            benchmark_group_name="timing_accuracy",
+            benchmark_config_file=os.path.join(CURRENT_DIR, "ci.yaml"),
+            transform_func=transform_single_result,
+            op=args.test_op,
+            ci=args.ci,
+            log_scuba=args.log_scuba,
+        )
+        return
+
+    tb_parser = get_parser()
 
     tb_args, extra_args = tb_parser.parse_known_args(extra_args)
     _run(args, tb_args, extra_args)
+
 
 
 if __name__ == "__main__":

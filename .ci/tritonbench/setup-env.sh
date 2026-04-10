@@ -40,7 +40,9 @@ else
     . "${SETUP_SCRIPT}"
 fi
 
-export CONDA_ENV=pytorch
+if [ -n "${CONDA_ENV:-}" ]; then
+    export CONDA_ENV=pytorch
+fi
 echo "if [ -z \${CONDA_ENV} ]; then export CONDA_ENV=${CONDA_ENV}; fi" >> "${SETUP_SCRIPT}"
 
 python3 tools/python_utils.py --create-conda-env ${CONDA_ENV}
@@ -50,8 +52,8 @@ if [ -n "${UV_VENV_DIR:-}" ]; then
 else
     echo "conda activate \${CONDA_ENV}" >> "${SETUP_SCRIPT}"
     . "${SETUP_SCRIPT}"
-    python -m tools.cuda_utils --install-torch-deps
 fi
+python -m tools.cuda_utils --install-torch-deps
 
 bash .ci/tritonbench/install-pytorch-source.sh
 
@@ -67,6 +69,7 @@ if [ -n "${USE_CUDA:-}" ]; then
 
 elif [ -n "${USE_HIP:-}" ]; then
     python -m tools.cuda_utils --install-torch-nightly --hip
+    bash ./.ci/tritonbench/setup-rocm-path.sh
 else
     echo "Unknown backend. Only CUDA and HIP are supported."
     exit 1

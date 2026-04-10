@@ -30,6 +30,7 @@ import gc
 from typing import Any, Callable, Generator, List, Optional
 
 import torch
+from tritonbench.utils.env_utils import is_blackwell, is_hip
 from tritonbench.utils.triton_op import (
     BenchmarkOperator,
     BenchmarkOperatorMetrics,
@@ -158,6 +159,8 @@ def parse_args(args):
 
 class Operator(BenchmarkOperator):
     DEFAULT_PRECISION = "bf16"
+    # Backward pass does not work on AMD
+    FWD_ONLY = is_hip()
 
     def __init__(
         self, tb_args: argparse.Namespace, extra_args: Optional[List[str]] = None
@@ -172,7 +175,7 @@ class Operator(BenchmarkOperator):
         self.head = args.head
         self.kv_len = args.kv_len
 
-    @register_benchmark(enabled=has_tlx())
+    @register_benchmark(enabled=has_tlx() and is_blackwell())
     def tlx_gdpa(
         self,
         _config_name,
@@ -331,7 +334,7 @@ class Operator(BenchmarkOperator):
 
         return _inner
 
-    @register_benchmark()
+    @register_benchmark(enabled=not is_hip())
     def torch_compile_gdpa(
         self,
         _config_name,

@@ -4,6 +4,7 @@ Requires PyTorch
 """
 
 import argparse
+import importlib
 import logging
 import os
 import shutil
@@ -36,6 +37,24 @@ AVAILABLE_PRECISIONS = [
 
 def is_fbcode() -> bool:
     return not hasattr(torch.version, "git_version")
+
+
+def is_triton_beta() -> bool:
+    return "fb.beta" in triton.__version__
+
+
+def is_triton_stable() -> bool:
+    return is_fbcode() and not is_triton_beta()
+
+
+def is_meta_triton() -> bool:
+    tlx_module = "triton.language.extra.tlx"
+    spec = importlib.util.find_spec(tlx_module)
+    return spec is not None
+
+
+def is_triton_main():
+    return not is_fbcode() and not is_meta_triton()
 
 
 def is_cuda() -> bool:
@@ -117,12 +136,33 @@ def is_blackwell() -> bool:
 IS_BLACKWELL = is_blackwell()
 
 
+def is_hopper() -> bool:
+    """Check if running on an NVIDIA Hopper GPU (H100, H200, etc.)."""
+    if not is_cuda_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability()[0] == 9
+    except Exception:
+        return False
+
+
+IS_HOPPER = is_hopper()
+
+
 def is_h100() -> bool:
     """Check if running on an NVIDIA H100 GPU."""
     if not is_cuda_available():
         return False
     gpu_model = get_nvidia_gpu_model()
     return "H100" in gpu_model
+
+
+def is_b200() -> bool:
+    """Check if running on an NVIDIA B200 GPU."""
+    if not is_cuda_available():
+        return False
+    gpu_model = get_nvidia_gpu_model()
+    return "B200" in gpu_model
 
 
 def supports_tma():
@@ -132,6 +172,15 @@ def supports_tma():
         return torch.cuda.get_device_capability()[0] >= 9
     except Exception:
         return False
+
+
+def triton_support_ws():
+    import triton.language as tl
+
+    HAS_TMA_DESC = "nv_tma_desc_type" in dir(tl)
+    if not hasattr(tl, "async_task"):
+        return False
+    return HAS_TMA_DESC
 
 
 def is_cu130():
@@ -318,3 +367,4 @@ def set_torchrun_env():
             f"[distributed] Found TORCHELASTIC_RUN_ID={os.environ['TORCHELASTIC_RUN_ID']} and LOCAL_RANK={os.environ['LOCAL_RANK']}. "
             f"Set current device to: {torch.cuda.current_device()}"
         )
+        torch.distributed.init_process_group("nccl")

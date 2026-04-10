@@ -59,6 +59,21 @@ def get_parser(args=None):
         help="Device to benchmark.",
     )
     parser.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help="GPU device IDs to benchmark on, in CUDA_VISIBLE_DEVICES format "
+        "(e.g., '0-2,5' means GPUs 0,1,2,5). "
+        "When specified with --shard-by-inputs, inputs are distributed across devices in parallel.",
+    )
+    parser.add_argument(
+        "--shard-by-inputs",
+        action="store_true",
+        default=False,
+        help="Shard benchmark inputs evenly across the devices specified by --devices. "
+        "Each device runs a disjoint subset of inputs in parallel using --input-id and --num-inputs.",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=DEFAULT_WARMUP,
@@ -69,6 +84,18 @@ def get_parser(args=None):
         type=int,
         default=DEFAULT_REP,
         help="The rep time for each benchmark run.",
+    )
+    parser.add_argument(
+        "--autotune-warmup",
+        type=int,
+        default=None,
+        help="Warmup time in ms for Triton autotuning (sets TRITON_AUTOTUNE_WARMUP_MS). Default: Triton's default (25ms).",
+    )
+    parser.add_argument(
+        "--autotune-rep",
+        type=int,
+        default=None,
+        help="Rep time in ms for Triton autotuning (sets TRITON_AUTOTUNE_REP_MS). Default: Triton's default (100ms).",
     )
     parser.add_argument(
         "--sleep",
@@ -247,8 +274,35 @@ def get_parser(args=None):
     )
     parser.add_argument(
         "--gpu-lockdown",
+        nargs="?",
+        const=True,
+        default=False,
+        type=lambda x: int(x) if x.isdigit() else (x.lower() == "true"),
+        help="Lock down GPU frequency and clocks to avoid throttling. "
+        "Optionally specify target clock frequency in MHz (e.g., --gpu-lockdown 1000).",
+    )
+    parser.add_argument(
+        "--gpu-telemetry",
         action="store_true",
-        help="Lock down GPU frequency and clocks to avoid throttling.",
+        help="Enable GPU telemetry collection (clock, power, temperature, utilization).",
+    )
+    parser.add_argument(
+        "--gpu-telemetry-output",
+        type=str,
+        default=None,
+        help="Output directory for GPU telemetry CSV and charts. Required when --gpu-telemetry is enabled.",
+    )
+    parser.add_argument(
+        "--gpu-telemetry-interval-ms",
+        type=float,
+        default=10.0,
+        help="GPU telemetry sampling interval in milliseconds (default: 10).",
+    )
+    parser.add_argument(
+        "--gpu-lock-clock-mhz",
+        type=int,
+        default=None,
+        help="Target GPU clock frequency in MHz when using --gpu-lockdown (e.g., --gpu-lock-clock-mhz 1400). If not specified, uses max supported frequency.",
     )
     parser.add_argument(
         "--operator-loader",
@@ -460,4 +514,17 @@ def get_parser(args=None):
 
     if args.metrics and "walltime_kineto_trace" in args.metrics and args.repcnt is None:
         parser.error("Walltime Kineto trace requires --repcnt to be specified")
+
+    if args.shard_by_inputs and not args.devices:
+        parser.error("--shard-by-inputs requires --devices to be specified")
+    if args.devices and args.device != "cuda":
+        parser.error("--devices is only supported with --device cuda")
+    if args.devices:
+        from tritonbench.utils.device_utils import parse_device_range
+
+        try:
+            parse_device_range(args.devices)
+        except ValueError as e:
+            parser.error(f"Invalid --devices value: {e}")
+
     return parser

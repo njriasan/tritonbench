@@ -44,7 +44,7 @@ if SUPPORT_GLUON:
 
 import logging
 
-from tritonbench.utils.env_utils import IS_BLACKWELL
+from tritonbench.utils.env_utils import IS_BLACKWELL, is_blackwell
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,18 @@ except (ImportError, IOError, AttributeError):
 
 # [Optional] CuTe
 try:
+    import cutlass
     from mslk.attention.flash_attn.interface import (
         flash_attn_func as facute_flash_attn_func,
+    )
+
+    print(
+        f"TRITONBENCH CUTLASS INFO: cutlass.CUDA_VERSION {cutlass.CUDA_VERSION}",
+        flush=True,
+    )
+    print(
+        f"TRITONBENCH CUTLASS INFO: cutlass.__version__ {cutlass.__version__}",
+        flush=True,
     )
 
     HAS_FLASH_CUTE = True
@@ -74,7 +84,10 @@ except SystemError as e:
 
 # [Optional] OSS Flash Attention v4
 try:
-    from flash_attn.cute import flash_attn_func as oss_fa4_flash_attn_func
+    from flash_attn.cute import (
+        flash_attn_func as oss_fa4_flash_attn_func,
+        flash_attn_varlen_func as oss_fa4_flash_attn_varlen_func,
+    )
 
     HAS_OSS_FA4 = True
 except (ImportError, IOError, AttributeError):
@@ -117,7 +130,7 @@ except ImportError:
     HAS_TLX = False
 
 if HAS_TLX:
-    from tritonbench.kernels.tlx_attention_ws_pipelined import (
+    from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
         attention as tlx_blackwell,
     )
 
@@ -158,7 +171,9 @@ def parse_op_args(args: List[str]):
         default=1,
         help="Number of heads per KV group for GQA",
     )
-    parser.add_argument("--d-head", type=int, default=64, help="specify head dimension")
+    parser.add_argument(
+        "--d-head", type=int, default=128, help="specify head dimension"
+    )
     parser.add_argument(
         "--causal",
         action="store_true",
@@ -200,6 +215,11 @@ def parse_op_args(args: List[str]):
         default=0,
         help="Max inputs per iteration. This is used when --gen-cache-size-inputs is on.",
     )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="Use variable-length (varlen) interface with packed tensors and cu_seqlens",
+    )
     return parser.parse_args(args)
 
 
@@ -208,7 +228,11 @@ def unpack_inputs(*args):
     if len(args) == 1 and isinstance(args[0], xformers_fmha.Inputs):
         inp = args[0]
         inputs = (inp.query, inp.key, inp.value)
-    return (t.detach() for t in inputs)
+    return (
+        t.detach()
+        for t in inputs
+        if isinstance(t, torch.Tensor) and t.is_floating_point()
+    )
 
 
 def detach_and_requires_grad(t: torch.Tensor):
@@ -223,7 +247,13 @@ def detach_inputs(*args):
         inp.key = detach_and_requires_grad(inp.key)
         inp.value = detach_and_requires_grad(inp.value)
         return (inp,)
-    return [detach_and_requires_grad(t) for t in inputs]
+    result = []
+    for t in inputs:
+        if isinstance(t, torch.Tensor) and t.is_floating_point():
+            result.append(detach_and_requires_grad(t))
+        else:
+            result.append(t)
+    return result
 
 
 def multi_input_wrapper(fn):
@@ -246,7 +276,14 @@ def multi_input_wrapper(fn):
                 outputs.append(benchmark_fn(*i))
             return outputs
 
-        self.optims[multi_input_fn] = torch.optim.SGD(all_inputs)
+        self.optims[multi_input_fn] = torch.optim.SGD(all_inputs, foreach=True)
+
+        multi_input_fn._grad_inputs = [
+            t
+            for inp in inputs
+            for t in inp
+            if isinstance(t, torch.Tensor) and t.requires_grad
+        ]
 
         return multi_input_fn
 
@@ -258,8 +295,22 @@ def preproc_noop(*args):
     return args
 
 
-def preproc_permute(q, k, v):
-    return [t.contiguous() for t in permute_qkv(q, k, v, perm=(0, 2, 1, 3))]
+def preproc_permute(q, k, v, varlen=False):
+    q, k, v = [t.contiguous() for t in permute_qkv(q, k, v, perm=(0, 2, 1, 3))]
+    if not varlen:
+        return [q, k, v]
+    B, S_Q, H, D = q.shape
+    _, S_KV, H_KV, _ = k.shape
+    cu_seqlens_q = torch.arange(
+        0, (B + 1) * S_Q, S_Q, dtype=torch.int32, device=q.device
+    )
+    cu_seqlens_k = torch.arange(
+        0, (B + 1) * S_KV, S_KV, dtype=torch.int32, device=q.device
+    )
+    q_packed = q.reshape(-1, H, D).contiguous()
+    k_packed = k.reshape(-1, H_KV, D).contiguous()
+    v_packed = v.reshape(-1, H_KV, D).contiguous()
+    return [q_packed, k_packed, v_packed, cu_seqlens_q, cu_seqlens_k, S_Q, S_KV]
 
 
 def _sdpa_cudnn_attention(q, k, v, is_causal=False, scale=False):
@@ -331,9 +382,10 @@ class Operator(BenchmarkOperator):
         self.deterministic = args.deterministic
         self.gen_cache_size_inputs = args.gen_cache_size_inputs
         self.max_inputs_per_iter = args.max_inputs_per_iter
+        self.varlen = args.varlen
         self.optims = {}
 
-    @register_benchmark()
+    @register_benchmark(baseline=True)
     @multi_input_wrapper
     def aten(self, *args) -> Tuple[Callable, Callable]:
         def _inner(q, k, v):
@@ -361,7 +413,7 @@ class Operator(BenchmarkOperator):
 
         return preproc_noop, _inner
 
-    @register_benchmark()
+    @register_benchmark(baseline=True)
     @multi_input_wrapper
     def sdpa(self, *args) -> Tuple[Callable, Callable]:
         if self.local:
@@ -443,7 +495,7 @@ class Operator(BenchmarkOperator):
             causal=self.causal,
             window_size=self.window_size if self.local else (-1, -1),
             deterministic=self.deterministic,
-            bottom_right=False,
+            bottom_right=True,
         )
         return preproc_permute, fn
 
@@ -478,26 +530,68 @@ class Operator(BenchmarkOperator):
     @register_benchmark(enabled=(IS_BLACKWELL and HAS_FLASH_CUTE), label="FAv4")
     @multi_input_wrapper
     def cutedsl_blackwell(self, *args) -> Tuple[Callable, Callable]:
-        fn = partial(
-            facute_flash_attn_func,
-            softmax_scale=self.sm_scale,
-            causal=self.causal,
-            window_size=self.window_size if self.local else (None, None),
-            deterministic=self.deterministic,
-        )
-        return preproc_permute, fn
+        if self.varlen:
+
+            def fn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
+                return facute_flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seq_len_q=max_seqlen_q,
+                    max_seq_len_k=max_seqlen_k,
+                    softmax_scale=self.sm_scale,
+                    causal=self.causal,
+                    window_size=self.window_size if self.local else (None, None),
+                    deterministic=self.deterministic,
+                    bottom_right=True,
+                )
+
+            return partial(preproc_permute, varlen=True), fn
+        else:
+            fn = partial(
+                facute_flash_attn_func,
+                softmax_scale=self.sm_scale,
+                causal=self.causal,
+                window_size=self.window_size if self.local else (None, None),
+                deterministic=self.deterministic,
+                bottom_right=True,
+            )
+            return preproc_permute, fn
 
     @register_benchmark(enabled=(IS_BLACKWELL and HAS_OSS_FA4), label="OSS-FAv4")
     @multi_input_wrapper
     def oss_fa4(self, *args) -> Tuple[Callable, Callable]:
-        fn = partial(
-            oss_fa4_flash_attn_func,
-            softmax_scale=self.sm_scale,
-            causal=self.causal,
-            window_size=self.window_size if self.local else (None, None),
-            deterministic=self.deterministic,
-        )
-        return preproc_permute, fn
+        if self.varlen:
+
+            def fn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
+                return oss_fa4_flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    seqused_q=None,
+                    seqused_k=None,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.sm_scale,
+                    causal=self.causal,
+                    window_size=self.window_size if self.local else (None, None),
+                    deterministic=self.deterministic,
+                )
+
+            return partial(preproc_permute, varlen=True), fn
+        else:
+            fn = partial(
+                oss_fa4_flash_attn_func,
+                softmax_scale=self.sm_scale,
+                causal=self.causal,
+                window_size=self.window_size if self.local else (None, None),
+                deterministic=self.deterministic,
+            )
+            return preproc_permute, fn
 
     @register_benchmark()
     @multi_input_wrapper
@@ -558,31 +652,51 @@ class Operator(BenchmarkOperator):
 
         return preproc_noop, fn
 
+    @register_benchmark(enabled=False and is_blackwell() and HAS_BLACKWELL_AUTOWS)
+    @multi_input_wrapper
+    def triton_tutorial_flash_persistent_blackwell(
+        self, *args
+    ) -> Tuple[Callable, Callable]:
+        def fn(q, k, v):
+            return blackwell_triton_tutorial_FA2_opt(
+                q,
+                k,
+                v,
+                self.causal,
+                self.sm_scale,
+                "ws_persistent",
+            )
+
+        return preproc_noop, fn
+
     # Only works with triton main, forward only.
     @register_benchmark(enabled=SUPPORT_GLUON)
     @multi_input_wrapper
     def gluon_blackwell_tutorial_persistent_fwd(
         self, *args
     ) -> Tuple[Callable, Callable]:
-        fn = partial(
-            gluon_blackwell_persistent_fwd,
-            causal=self.causal,
-            sm_scale=self.sm_scale,
-        )
+        def fn(q, k, v):
+            o, _M = gluon_blackwell_persistent_fwd(
+                q, k, v, causal=self.causal, sm_scale=self.sm_scale
+            )
+            return o
+
         return preproc_noop, fn
 
     # Only works with triton beta, forward only.
     @register_benchmark(enabled=HAS_TLX)
     @multi_input_wrapper
     def tlx_blackwell_ws_pipelined_fwd(self, *args) -> Tuple[Callable, Callable]:
+        if self.D_HEAD < 128:
+            raise NotImplementedError("TLX only supports d_head >= 128")
+
         def fn(q, k, v):
             return tlx_blackwell(
                 q,
                 k,
                 v,
-                self.causal,
                 self.sm_scale,
-                False,
+                self.causal,
             )
 
         return preproc_noop, fn
@@ -596,9 +710,8 @@ class Operator(BenchmarkOperator):
                 q,
                 k,
                 v,
-                self.causal,
                 self.sm_scale,
-                True,
+                self.causal,
             )
 
         return preproc_noop, fn
@@ -635,6 +748,35 @@ class Operator(BenchmarkOperator):
             flops *= 3.5  # 1.0(fwd) + 2.0(bwd) + 0.5(recompute)
         return flops
 
+    def _check_gradients(self, grads, baseline_grads, mode=""):
+        """Check backward gradients with flash-attention-appropriate tolerances.
+
+        Uses the same max-absolute-error approach and atol=1e-2 as the
+        standalone test in test_tlx_bwd_from_fused_attention.py.
+        """
+        atol = self.tb_args.atol if self.tb_args.atol is not None else 1e-2
+        prefix = f"{mode}: " if mode else ""
+
+        assert len(grads) == len(baseline_grads), (
+            f"{prefix}Mismatch in number of grad tensors"
+        )
+
+        has_gradient = False
+        for i, (grad, baseline_grad) in enumerate(zip(grads, baseline_grads)):
+            if (grad is None) != (baseline_grad is None):
+                return False
+            if grad is not None:
+                has_gradient = True
+                max_err = (grad.float() - baseline_grad.float()).abs().max().item()
+                if max_err > atol:
+                    logger.warning(
+                        f"{prefix}tensor {i}: max_err={max_err:.6e} > atol={atol}"
+                    )
+                    return False
+
+        assert has_gradient, f"{prefix}No gradients were computed."
+        return True
+
     def get_bwd_fn(self, fwd_fn: Callable) -> Callable:
         if self.use_cuda_graphs:
             stream = self.get_cudagraph_stream()
@@ -642,28 +784,30 @@ class Operator(BenchmarkOperator):
         else:
             stream = torch.cuda.current_stream()
 
+        grad_inputs = getattr(fwd_fn, "_grad_inputs", None)
+
         with torch.cuda.stream(stream):
             o = fwd_fn()
             outputs = [
                 input_filter(lambda x: isinstance(x, torch.Tensor), o_) for o_ in o
             ]
-            dOs = [torch.rand_like(o_).detach() for o_ in outputs]
-            zero_grad = (
-                self.optims[fwd_fn].zero_grad
-                if fwd_fn in self.optims
-                else lambda set_to_none: None
-            )
+            torch.manual_seed(0)
+            dOs = [0.1 * torch.randn_like(o_).detach() for o_ in outputs]
 
         if self.use_cuda_graphs:
             torch.cuda.current_stream().wait_stream(stream)
 
         def fn():
-            zero_grad(set_to_none=True)
+            if grad_inputs:
+                for t in grad_inputs:
+                    if t.grad is not None:
+                        t.grad = None
             for (
                 o_tensor,
                 do,
             ) in zip(outputs, dOs):
                 o_tensor.backward(do, retain_graph=True)
+            return grad_inputs
 
         return fn
 
