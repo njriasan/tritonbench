@@ -329,6 +329,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                     "GROUP_SIZE_M": 8,
                     "EPILOGUE_SUBTILE": SUBTILE,
                     "FLATTEN": FLATTEN,
+                    "DATA_PARTITION_FACTOR": DP,
                 },
                 num_stages=s,
                 num_warps=w,
@@ -341,6 +342,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
             for w in [4, 8]  #
             for SUBTILE in [1, 2, 4]  #
             for FLATTEN in [True, False]  #
+            for DP in [1, 2]  #
         ]
 
 
@@ -367,6 +369,10 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
         else:
             if not flatten:
                 continue
+        data_partition_factor = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
+        block_m = c.kwargs.get("BLOCK_SIZE_M", 1)
+        if data_partition_factor != 1 and block_m != 256:
+            continue
         kept.append(c)
     return _prune_warp_specialize_configs(kept, named_args, **kwargs)
 
@@ -398,6 +404,7 @@ def matmul_kernel_tma_persistent(
     TRANSPOSE_A: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
     TMA_STORE: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,  #
 ):
     dtype = DTYPE
     start_pid = tl.program_id(axis=0)
@@ -413,7 +420,13 @@ def matmul_kernel_tma_persistent(
     # FIXME: This only works on Blackwell right now. On older GPUs, this will
     # use software pipelining.
     for tile_id in tl.range(
-        start_pid, num_tiles, NUM_SMS, flatten=FLATTEN, warp_specialize=WARP_SPECIALIZE
+        start_pid,
+        num_tiles,
+        NUM_SMS,
+        flatten=FLATTEN,
+        warp_specialize=WARP_SPECIALIZE,
+        data_partition_factor=DATA_PARTITION_FACTOR,
+        smem_alloc_algo=1,
     ):
         pid_m, pid_n = _compute_pid(
             tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
@@ -484,12 +497,18 @@ def matmul_kernel_tma_persistent(
             accumulator = accumulator.to(dtype)
             offs_cm = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
             offs_cn = offs_bn_c + tl.arange(0, BLOCK_SIZE_N)
-            c_ptrs = c_desc_or_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+            c_ptrs = (
+                c_desc_or_ptr
+                + stride_cm * offs_cm[:, None]
+                + stride_cn * offs_cn[None, :]
+            )
             c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
             tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def blackwell_matmul_tma_persistent(a, b, warp_specialize: bool, tma_store: bool = True):
+def blackwell_matmul_tma_persistent(
+    a, b, warp_specialize: bool, tma_store: bool = True
+):
     # High-Level Options for B's layout
     # 1. (K, N) contiguous in N
     # 2. (K, N) contiguous in K
