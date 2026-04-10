@@ -18,7 +18,142 @@ with try_import("HAS_CUTEDSL"):
 
     from .cutedsl import cutedsl_nop_kernel, cutedsl_nop_with_args_kernel
 
-from .kernels import get_trivial_add_kernel, nop_kernel, nop_with_args_kernel
+from .kernels import (
+    get_trivial_add_kernel,
+    nop_kernel,
+    nop_with_args_kernel,
+    nop_with_kwargs_kernel,
+)
+
+
+def _patch_triton_run_profiling():
+    """Monkey-patch JITFunction.run to profile launch overhead breakdown."""
+    from triton.runtime.jit import JITFunction
+
+    if hasattr(JITFunction, "_original_run"):
+        return  # already patched
+
+    original_run = JITFunction.run
+
+    def profiled_run(self_jit, *args, grid, warmup, **kwargs):
+        import time as _time
+
+        from triton.runtime.jit import compute_cache_key, driver, knobs
+
+        _t0 = _time.perf_counter()
+
+        kwargs["debug"] = kwargs.get("debug", self_jit.debug) or knobs.runtime.debug
+
+        _t1 = _time.perf_counter()
+        device = driver.active.get_current_device()
+        stream = driver.active.get_current_stream(device)
+        _t2 = _time.perf_counter()
+
+        for hook in self_jit.pre_run_hooks:
+            hook(*args, **kwargs)
+
+        _t3 = _time.perf_counter()
+        kernel_cache, kernel_key_cache, target, backend, binder = (
+            self_jit.device_caches[device]
+        )
+        bound_args, specialization, options = binder(*args, **kwargs)
+        _t4 = _time.perf_counter()
+
+        key = compute_cache_key(kernel_key_cache, specialization, options)
+        kernel = kernel_cache.get(key, None)
+        _t5 = _time.perf_counter()
+
+        if kernel is None:
+            # Fall back to original for compilation
+            JITFunction.run = original_run
+            result = original_run(self_jit, *args, grid=grid, warmup=warmup, **kwargs)
+            JITFunction.run = profiled_run
+            return result
+
+        not_present = object()
+        for (name, _), (val, globals_dict) in self_jit.used_global_vals.items():
+            if globals_dict.get(name, not_present) != val:
+                raise RuntimeError(f"Global variable {name} has changed")
+        _t6 = _time.perf_counter()
+
+        if not warmup:
+            assert grid is not None
+            if callable(grid):
+                grid = grid(bound_args)
+            grid_size = len(grid)
+            grid_0 = grid[0]
+            grid_1 = grid[1] if grid_size > 1 else 1
+            grid_2 = grid[2] if grid_size > 2 else 1
+            if hasattr(kernel, "result"):
+                kernel = kernel.result()
+
+            _t7 = _time.perf_counter()
+            launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+            kernel.run(
+                grid_0,
+                grid_1,
+                grid_2,
+                stream,
+                kernel.function,
+                kernel.packed_metadata,
+                launch_metadata,
+                knobs.runtime.launch_enter_hook,
+                knobs.runtime.launch_exit_hook,
+                *bound_args.values(),
+            )
+            _t8 = _time.perf_counter()
+
+            _profiled_run_samples.append(
+                (
+                    (_t1 - _t0) * 1e6,  # preamble
+                    (_t2 - _t1) * 1e6,  # driver (device+stream)
+                    (_t3 - _t2) * 1e6,  # hooks
+                    (_t4 - _t3) * 1e6,  # binder
+                    (_t5 - _t4) * 1e6,  # cache_key+lookup
+                    (_t6 - _t5) * 1e6,  # global_check
+                    (_t7 - _t6) * 1e6,  # grid
+                    (_t8 - _t7) * 1e6,  # launch
+                    (_t8 - _t0) * 1e6,  # TOTAL
+                )
+            )
+
+        return kernel
+
+    JITFunction._original_run = original_run
+    JITFunction.run = profiled_run
+
+
+_profiled_run_samples = []
+
+
+def _print_profiling_summary():
+    if not _profiled_run_samples:
+        return
+    labels = [
+        "preamble",
+        "driver",
+        "hooks",
+        "binder",
+        "cache_key+lookup",
+        "global_check",
+        "grid",
+        "launch",
+        "TOTAL",
+    ]
+    n = len(_profiled_run_samples)
+    # skip first 10% as warmup
+    skip = max(1, n // 10)
+    samples = _profiled_run_samples[skip:]
+    if not samples:
+        samples = _profiled_run_samples
+    avgs = [sum(s[i] for s in samples) / len(samples) for i in range(len(labels))]
+    print(
+        "\n[triton-launch-profile] Average over %d samples (skipped %d warmup):"
+        % (len(samples), skip)
+    )
+    for label, avg in zip(labels, avgs):
+        print(f"  {label:20s}: {avg:8.2f} us")
+    print()
 
 
 def _patch_triton_run_profiling():
@@ -185,6 +320,22 @@ class Operator(BenchmarkOperator):
         if len(args) == 0:
             return lambda: nop_kernel[1,]()
         return lambda: nop_with_args_kernel[1,](*args)
+
+    @register_benchmark()
+    def nop_triton_kernel_kwargs(self, *args):
+        """Same as nop_triton_kernel but passes constexpr params as kwargs."""
+        if len(args) == 0:
+            return lambda: nop_kernel[1,]()
+        pos_args = args[:14]
+        kw_vals = args[14:] if len(args) > 14 else (32, 32, 32, 32, 32)
+        return lambda: nop_with_kwargs_kernel[1,](
+            *pos_args,
+            BLOCK_C1=kw_vals[0],
+            BLOCK_C2=kw_vals[1],
+            BLOCK_C3=kw_vals[2],
+            BLOCK_C4=kw_vals[3],
+            BLOCK_C5=kw_vals[4],
+        )
 
     @register_benchmark()
     def nop_triton_compiled_kernel_run(self, *args):
