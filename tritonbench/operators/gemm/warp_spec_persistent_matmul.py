@@ -320,6 +320,10 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                     )
         return configs
     else:
+        extra_kwargs = {}
+        if _use_meta_ws():
+            extra_kwargs["early_tma_store_lowering"] = 1
+            extra_kwargs["maxRegAutoWS"] = 255
         return [
             triton.Config(
                 {
@@ -333,9 +337,8 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                 },
                 num_stages=s,
                 num_warps=w,
-                early_tma_store_lowering=1,
-                maxRegAutoWS=255,
                 pre_hook=pre_hook,
+                **extra_kwargs,
             )  #
             for BM in bm_range  #
             for BN in bn_range  #
