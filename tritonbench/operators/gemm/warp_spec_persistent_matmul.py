@@ -375,9 +375,12 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
             if not flatten:
                 continue
         data_partition_factor = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
-        block_m = c.kwargs.get("BLOCK_SIZE_M", 1)
-        if data_partition_factor != 1 and block_m != 256:
-            continue
+        if data_partition_factor != 1:
+            if not _use_meta_ws():
+                continue
+            block_m = c.kwargs.get("BLOCK_SIZE_M", 1)
+            if block_m != 256:
+                continue
         kept.append(c)
     return _prune_warp_specialize_configs(kept, named_args, **kwargs)
 
