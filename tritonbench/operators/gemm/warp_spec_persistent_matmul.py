@@ -349,7 +349,7 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
     """Prune configs for the TMA persistent kernel based on FLATTEN/WS rules.
 
     - WARP_SPECIALIZE=False: require FLATTEN=False
-    - WARP_SPECIALIZE=True + meta WS: any FLATTEN allowed
+    - WARP_SPECIALIZE=True + meta WS: require FLATTEN=False
     - WARP_SPECIALIZE=True + no meta WS: require FLATTEN=True
     """
     ws = kwargs.get("WARP_SPECIALIZE", False)
@@ -359,7 +359,10 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
         if not ws:
             if flatten:
                 continue
-        elif not _use_meta_ws():
+        elif _use_meta_ws():
+            if flatten:
+                continue
+        else:
             if not flatten:
                 continue
         kept.append(c)
