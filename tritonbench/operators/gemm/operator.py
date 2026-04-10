@@ -550,7 +550,7 @@ class Operator(BenchmarkOperator):
 
     if IS_BLACKWELL:
 
-        @register_benchmark(enabled=False)
+        @register_benchmark(enabled=True)
         def triton_blackwell_warpspec_persistent_matmul(self, a, b, bias) -> Callable:
             if bias is not None:
                 return (
@@ -562,7 +562,7 @@ class Operator(BenchmarkOperator):
                     a, b, warp_specialize=True
                 )
 
-        @register_benchmark(enabled=False)
+        @register_benchmark(enabled=True)
         def triton_blackwell_persistent_matmul(self, a, b, bias) -> Callable:
             if bias is not None:
                 return (
@@ -574,21 +574,21 @@ class Operator(BenchmarkOperator):
                     a, b, warp_specialize=False
                 )
 
-        @register_benchmark(enabled=False)
+        @register_benchmark(enabled=True)
         def triton_blackwell_warpspec_tma_matmul(self, a, b, bias) -> Callable:
             if bias is not None:
                 return lambda: blackwell_matmul_tma(a, b, warp_specialize=True) + bias
             else:
                 return lambda: blackwell_matmul_tma(a, b, warp_specialize=True)
 
-        @register_benchmark(enabled=False)
+        @register_benchmark(enabled=True)
         def triton_blackwell_tma_matmul(self, a, b, bias) -> Callable:
             if bias is not None:
                 return lambda: blackwell_matmul_tma(a, b, warp_specialize=False) + bias
             else:
                 return lambda: blackwell_matmul_tma(a, b, warp_specialize=False)
 
-        @register_benchmark(enabled=False)
+        @register_benchmark(enabled=True)
         def triton_blackwell_warpspec_descriptor_matmul(self, a, b, bias) -> Callable:
             if bias is not None:
                 return (
@@ -602,7 +602,7 @@ class Operator(BenchmarkOperator):
                     a, b, warp_specialize=True
                 )
 
-        @register_benchmark(enabled=False)
+        @register_benchmark(enabled=True)
         def triton_blackwell_descriptor_matmul(self, a, b, bias) -> Callable:
             if bias is not None:
                 return (
