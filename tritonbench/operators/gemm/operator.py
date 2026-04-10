@@ -428,32 +428,30 @@ class Operator(BenchmarkOperator):
 
         return lambda: compiled(a, b)
 
-    if IS_BLACKWELL:
+    @register_benchmark(enabled=IS_BLACKWELL and has_tlx())
+    def torch_tlx_mm(self, a, b, bias) -> Callable:
+        torch._dynamo.reset()
+        inductor_config_patch = {
+            "max_autotune": True,
+            "max_autotune_gemm_backends": "TRITON",
+            "autotune_fallback_to_aten": False,
+            "autotune_num_choices_displayed": self.inductor_autotune_num_choices_displayed,
+            "force_disable_caches": True,
+        }
+        from torch._inductor.fb.tlx_templates import tlx_config
 
-        @register_benchmark(enabled=has_tlx())
-        def torch_tlx_mm(self, a, b, bias) -> Callable:
-            torch._dynamo.reset()
-            inductor_config_patch = {
-                "max_autotune": True,
-                "max_autotune_gemm_backends": "TRITON",
-                "autotune_fallback_to_aten": False,
-                "autotune_num_choices_displayed": self.inductor_autotune_num_choices_displayed,
-                "force_disable_caches": True,
-            }
-            from torch._inductor.fb.tlx_templates import tlx_config
+        with (
+            tlx_config.patch(tlx_mode="force"),
+            inductor_config.patch(inductor_config_patch),
+        ):
+            if bias is not None:
+                f = lambda a, b: a.contiguous().matmul(b.contiguous()) + bias
+            else:
+                f = lambda a, b: a.contiguous().matmul(b.contiguous())
+            compiled = torch.compile(f, dynamic=False)
+            compiled(a, b)
 
-            with (
-                tlx_config.patch(tlx_mode="force"),
-                inductor_config.patch(inductor_config_patch),
-            ):
-                if bias is not None:
-                    f = lambda a, b: a.contiguous().matmul(b.contiguous()) + bias
-                else:
-                    f = lambda a, b: a.contiguous().matmul(b.contiguous())
-                compiled = torch.compile(f, dynamic=False)
-                compiled(a, b)
-
-            return lambda: compiled(a, b)
+        return lambda: compiled(a, b)
 
     @register_benchmark(enabled=False)
     def pt2_matmul_maxautotune(self, a, b, bias) -> Callable:
@@ -671,166 +669,160 @@ class Operator(BenchmarkOperator):
         else:
             return lambda: _tlx_matmul_2cta(a_contig, b_contig).to(target_dtype)
 
-    if IS_BLACKWELL:
+    @register_benchmark(enabled=IS_BLACKWELL)
+    def triton_blackwell_warpspec_persistent_matmul(self, a, b, bias) -> Callable:
+        if bias is not None:
+            return (
+                lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=True)
+                + bias
+            )
+        else:
+            return lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=True)
 
-        @register_benchmark(enabled=True)
-        def triton_blackwell_warpspec_persistent_matmul(self, a, b, bias) -> Callable:
-            if bias is not None:
-                return (
-                    lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=True)
-                    + bias
-                )
-            else:
-                return lambda: blackwell_matmul_tma_persistent(
+    @register_benchmark(enabled=IS_BLACKWELL)
+    def triton_blackwell_persistent_matmul(self, a, b, bias) -> Callable:
+        if bias is not None:
+            return (
+                lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=False)
+                + bias
+            )
+        else:
+            return lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=False)
+
+    @register_benchmark(enabled=IS_BLACKWELL)
+    def triton_blackwell_warpspec_tma_matmul(self, a, b, bias) -> Callable:
+        if bias is not None:
+            return lambda: blackwell_matmul_tma(a, b, warp_specialize=True) + bias
+        else:
+            return lambda: blackwell_matmul_tma(a, b, warp_specialize=True)
+
+    @register_benchmark(enabled=IS_BLACKWELL)
+    def triton_blackwell_tma_matmul(self, a, b, bias) -> Callable:
+        if bias is not None:
+            return lambda: blackwell_matmul_tma(a, b, warp_specialize=False) + bias
+        else:
+            return lambda: blackwell_matmul_tma(a, b, warp_specialize=False)
+
+    @register_benchmark(enabled=IS_BLACKWELL)
+    def triton_blackwell_warpspec_descriptor_matmul(self, a, b, bias) -> Callable:
+        if bias is not None:
+            return (
+                lambda: blackwell_matmul_descriptor_persistent(
                     a, b, warp_specialize=True
                 )
+                + bias
+            )
+        else:
+            return lambda: blackwell_matmul_descriptor_persistent(
+                a, b, warp_specialize=True
+            )
 
-        @register_benchmark(enabled=True)
-        def triton_blackwell_persistent_matmul(self, a, b, bias) -> Callable:
-            if bias is not None:
-                return (
-                    lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=False)
-                    + bias
-                )
-            else:
-                return lambda: blackwell_matmul_tma_persistent(
+    @register_benchmark(enabled=IS_BLACKWELL)
+    def triton_blackwell_descriptor_matmul(self, a, b, bias) -> Callable:
+        if bias is not None:
+            return (
+                lambda: blackwell_matmul_descriptor_persistent(
                     a, b, warp_specialize=False
                 )
-
-        @register_benchmark(enabled=True)
-        def triton_blackwell_warpspec_tma_matmul(self, a, b, bias) -> Callable:
-            if bias is not None:
-                return lambda: blackwell_matmul_tma(a, b, warp_specialize=True) + bias
-            else:
-                return lambda: blackwell_matmul_tma(a, b, warp_specialize=True)
-
-        @register_benchmark(enabled=True)
-        def triton_blackwell_tma_matmul(self, a, b, bias) -> Callable:
-            if bias is not None:
-                return lambda: blackwell_matmul_tma(a, b, warp_specialize=False) + bias
-            else:
-                return lambda: blackwell_matmul_tma(a, b, warp_specialize=False)
-
-        @register_benchmark(enabled=True)
-        def triton_blackwell_warpspec_descriptor_matmul(self, a, b, bias) -> Callable:
-            if bias is not None:
-                return (
-                    lambda: blackwell_matmul_descriptor_persistent(
-                        a, b, warp_specialize=True
-                    )
-                    + bias
-                )
-            else:
-                return lambda: blackwell_matmul_descriptor_persistent(
-                    a, b, warp_specialize=True
-                )
-
-        @register_benchmark(enabled=True)
-        def triton_blackwell_descriptor_matmul(self, a, b, bias) -> Callable:
-            if bias is not None:
-                return (
-                    lambda: blackwell_matmul_descriptor_persistent(
-                        a, b, warp_specialize=False
-                    )
-                    + bias
-                )
-            else:
-                return lambda: blackwell_matmul_descriptor_persistent(
-                    a, b, warp_specialize=False
-                )
-
-        @register_benchmark(enabled=HAS_TILELANG and is_cu130())
-        def tilelang_blackwell_matmul(self, a, b, bias) -> Callable:
-            assert bias is None, "Tilelang does not support bias"
-            assert a.dtype == torch.bfloat16, "Tilelang only supports bf16"
-            return tilelang_matmul_func(a, b)
-
-        @register_benchmark(enabled=HAS_CUTLASS_API)
-        def cutlass_api_matmul(self, a, b, bias) -> Callable:
-            assert bias is None, "Cutlass API gemm does not currently support bias"
-            M, _ = a.shape
-            _, N = b.shape
-
-            c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-            args = cutlass_api.arguments.GemmArguments(
-                a, b, c, accumulator_type=torch.float32
+                + bias
             )
-            kernel = cutlass_api.get_kernels(args, cc=100)[71]
-            compiled_artifact = kernel.compile(args)
-
-            def out():
-                kernel.run(args, compiled_artifact, assume_supported_args=True)
-                return c
-
-            return out
-
-        @register_benchmark(enabled=False)
-        def cutlass_api_matmul_exhaustive_autotune(self, a, b, bias) -> Callable:
-            assert bias is None, "Cutlass API gemm does not currently support bias"
-            M, _ = a.shape
-            _, N = b.shape
-
-            c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-            args = cutlass_api.arguments.GemmArguments(
-                a, b, c, accumulator_type=torch.float32
+        else:
+            return lambda: blackwell_matmul_descriptor_persistent(
+                a, b, warp_specialize=False
             )
-            kernel, compiled_artifact = get_best_cutlass_api_kernel(args)
 
-            def out():
-                kernel.run(args, compiled_artifact, assume_supported_args=True)
-                return c
+    @register_benchmark(enabled=IS_BLACKWELL and HAS_TILELANG and is_cu130())
+    def tilelang_blackwell_matmul(self, a, b, bias) -> Callable:
+        assert bias is None, "Tilelang does not support bias"
+        assert a.dtype == torch.bfloat16, "Tilelang only supports bf16"
+        return tilelang_matmul_func(a, b)
 
-            return out
+    @register_benchmark(enabled=IS_BLACKWELL and HAS_CUTLASS_API)
+    def cutlass_api_matmul(self, a, b, bias) -> Callable:
+        assert bias is None, "Cutlass API gemm does not currently support bias"
+        M, _ = a.shape
+        _, N = b.shape
 
-        @register_benchmark(enabled=False)
-        def cutlass_api_matmul_heuristic(self, a, b, bias) -> Callable:
-            """Use nvMatmulHeuristic to narrow down kernel choices before autotuning."""
-            assert bias is None, "Cutlass API gemm does not currently support bias"
-            M, K = a.shape
-            _, N = b.shape
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        args = cutlass_api.arguments.GemmArguments(
+            a, b, c, accumulator_type=torch.float32
+        )
+        kernel = cutlass_api.get_kernels(args, cc=100)[71]
+        compiled_artifact = kernel.compile(args)
 
-            c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-            args = cutlass_api.arguments.GemmArguments(
-                a, b, c, accumulator_type=torch.float32
-            )
-            kernel, compiled_artifact = get_best_heuristic_kernel(
+        def out():
+            kernel.run(args, compiled_artifact, assume_supported_args=True)
+            return c
+
+        return out
+
+    @register_benchmark(enabled=False)
+    def cutlass_api_matmul_exhaustive_autotune(self, a, b, bias) -> Callable:
+        assert bias is None, "Cutlass API gemm does not currently support bias"
+        M, _ = a.shape
+        _, N = b.shape
+
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        args = cutlass_api.arguments.GemmArguments(
+            a, b, c, accumulator_type=torch.float32
+        )
+        kernel, compiled_artifact = get_best_cutlass_api_kernel(args)
+
+        def out():
+            kernel.run(args, compiled_artifact, assume_supported_args=True)
+            return c
+
+        return out
+
+    @register_benchmark(enabled=False)
+    def cutlass_api_matmul_heuristic(self, a, b, bias) -> Callable:
+        """Use nvMatmulHeuristic to narrow down kernel choices before autotuning."""
+        assert bias is None, "Cutlass API gemm does not currently support bias"
+        M, K = a.shape
+        _, N = b.shape
+
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        args = cutlass_api.arguments.GemmArguments(
+            a, b, c, accumulator_type=torch.float32
+        )
+        kernel, compiled_artifact = get_best_heuristic_kernel(
+            args,
+            m=M,
+            n=N,
+            k=K,
+            dtype_a=a.dtype,
+            dtype_b=b.dtype,
+            layout_a="row" if a.stride(1) == 1 else "col",
+            layout_b="row" if b.stride(1) == 1 else "col",
+            heuristic_count=5,
+        )
+
+        def out():
+            kernel.run(
                 args,
-                m=M,
-                n=N,
-                k=K,
-                dtype_a=a.dtype,
-                dtype_b=b.dtype,
-                layout_a="row" if a.stride(1) == 1 else "col",
-                layout_b="row" if b.stride(1) == 1 else "col",
-                heuristic_count=5,
+                compiled_artifact,
+                stream=torch.cuda.current_stream(),
+                assume_supported_args=True,
             )
+            return c
 
-            def out():
-                kernel.run(
-                    args,
-                    compiled_artifact,
-                    stream=torch.cuda.current_stream(),
-                    assume_supported_args=True,
-                )
-                return c
+        return out
 
-            return out
+    @register_benchmark(enabled=False)
+    def pt2_nvgemm_matmul(self, a, b, bias) -> Callable:
+        assert bias is None, "Cutlass API gemm does not currently support bias"
+        torch._dynamo.reset()
+        with inductor_config.patch(
+            max_autotune=True,
+            max_autotune_gemm_backends="NVGEMM",
+            autotune_fallback_to_aten=False,
+            autotune_num_choices_displayed=self.inductor_autotune_num_choices_displayed,
+        ):
+            f = lambda a, b: a.matmul(b)
+            compiled = torch.compile(f, dynamic=False)
+            compiled(a, b)
 
-        @register_benchmark(enabled=False)
-        def pt2_nvgemm_matmul(self, a, b, bias) -> Callable:
-            assert bias is None, "Cutlass API gemm does not currently support bias"
-            torch._dynamo.reset()
-            with inductor_config.patch(
-                max_autotune=True,
-                max_autotune_gemm_backends="NVGEMM",
-                autotune_fallback_to_aten=False,
-                autotune_num_choices_displayed=self.inductor_autotune_num_choices_displayed,
-            ):
-                f = lambda a, b: a.matmul(b)
-                compiled = torch.compile(f, dynamic=False)
-                compiled(a, b)
-
-            return lambda: compiled(a, b)
+        return lambda: compiled(a, b)
 
     @register_x_val(label="(M, N, K)")
     def get_x_val(self, example_inputs) -> Tuple[int, int, int]:
