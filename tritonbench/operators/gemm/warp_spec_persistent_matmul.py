@@ -382,6 +382,110 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
     return _prune_warp_specialize_configs(kept, named_args, **kwargs)
 
 
+@triton.jit
+def _matmul_tma_persistent_loop_body(
+    tile_id,
+    tile_id_c,
+    a_desc,
+    b_desc,
+    c_desc_or_ptr,
+    M,
+    N,
+    K,
+    stride_cm,
+    stride_cn,
+    num_pid_in_group,
+    num_pid_m,
+    k_tiles,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    DTYPE: tl.constexpr,
+    TRANSPOSE_A: tl.constexpr,
+    TRANSPOSE_B: tl.constexpr,
+    TMA_STORE: tl.constexpr,
+):
+    dtype = DTYPE
+    pid_m, pid_n = _compute_pid(
+        tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+    )
+    offs_am = pid_m * BLOCK_SIZE_M
+    offs_bn = pid_n * BLOCK_SIZE_N
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for ki in range(k_tiles):
+        offs_k = ki * BLOCK_SIZE_K
+        if TRANSPOSE_A:
+            a = a_desc.load([offs_k, offs_am])
+            arg1 = a.T
+        else:
+            a = a_desc.load([offs_am, offs_k])
+            arg1 = a
+        if TRANSPOSE_B:
+            b = b_desc.load([offs_bn, offs_k])
+            arg2 = b.T
+        else:
+            b = b_desc.load([offs_k, offs_bn])
+            arg2 = b
+        accumulator = tl.dot(arg1, arg2, accumulator)
+
+    tile_id_c += NUM_SMS
+    pid_m, pid_n = _compute_pid(
+        tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+    )
+    offs_am_c = pid_m * BLOCK_SIZE_M
+    offs_bn_c = pid_n * BLOCK_SIZE_N
+
+    if TMA_STORE:
+        # Epilogue subtiling is a technique to break our computation and stores
+        # into multiple pieces. By subtiling we can reduce shared memory consumption
+        # by the epilogue and instead use that memory to increase our stage count.
+        if EPILOGUE_SUBTILE == 1:
+            accumulator = accumulator.to(dtype)
+            c_desc_or_ptr.store([offs_am_c, offs_bn_c], accumulator)
+        elif EPILOGUE_SUBTILE == 2:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            c0 = acc0.to(dtype)
+            c_desc_or_ptr.store([offs_am_c, offs_bn_c], c0)
+            c1 = acc1.to(dtype)
+            c_desc_or_ptr.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc_lo, acc_hi = tl.split(acc)
+            acc_lo = tl.reshape(acc_lo, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+            acc_lo = tl.permute(acc_lo, (0, 2, 1))
+            acc0, acc1 = tl.split(acc_lo)
+            acc_hi = tl.reshape(acc_hi, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+            acc_hi = tl.permute(acc_hi, (0, 2, 1))
+            acc2, acc3 = tl.split(acc_hi)
+            c0 = acc0.to(dtype)
+            c_desc_or_ptr.store([offs_am_c, offs_bn_c], c0)
+            c1 = acc1.to(dtype)
+            c_desc_or_ptr.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 4], c1)
+            c2 = acc2.to(dtype)
+            c_desc_or_ptr.store([offs_am_c, offs_bn_c + 2 * BLOCK_SIZE_N // 4], c2)
+            c3 = acc3.to(dtype)
+            c_desc_or_ptr.store([offs_am_c, offs_bn_c + 3 * BLOCK_SIZE_N // 4], c3)
+        else:
+            tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
+    else:
+        accumulator = accumulator.to(dtype)
+        offs_cm = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = offs_bn_c + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = (
+            c_desc_or_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        )
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
+    return tile_id_c
+
+
 @triton.autotune(
     configs=matmul_tma_persistent_get_configs(pre_hook=matmul_tma_set_block_size_hook),
     key=["M", "N", "K", "WARP_SPECIALIZE"],
@@ -410,8 +514,8 @@ def matmul_kernel_tma_persistent(
     TRANSPOSE_B: tl.constexpr,
     TMA_STORE: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,  #
+    USE_META_WS: tl.constexpr,  #
 ):
-    dtype = DTYPE
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -421,94 +525,74 @@ def matmul_kernel_tma_persistent(
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    # Enable warp specialization to leverage async warp scheduling in the GPU.
-    # FIXME: This only works on Blackwell right now. On older GPUs, this will
-    # use software pipelining.
-    for tile_id in tl.range(
-        start_pid,
-        num_tiles,
-        NUM_SMS,
-        flatten=FLATTEN,
-        warp_specialize=WARP_SPECIALIZE,
-        data_partition_factor=DATA_PARTITION_FACTOR,
-        smem_alloc_algo=1,
-    ):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
-        offs_am = pid_m * BLOCK_SIZE_M
-        offs_bn = pid_n * BLOCK_SIZE_N
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for ki in range(k_tiles):
-            offs_k = ki * BLOCK_SIZE_K
-            if TRANSPOSE_A:
-                a = a_desc.load([offs_k, offs_am])
-                arg1 = a.T
-            else:
-                a = a_desc.load([offs_am, offs_k])
-                arg1 = a
-            if TRANSPOSE_B:
-                b = b_desc.load([offs_bn, offs_k])
-                arg2 = b.T
-            else:
-                b = b_desc.load([offs_k, offs_bn])
-                arg2 = b
-            accumulator = tl.dot(arg1, arg2, accumulator)
-
-        tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
-        offs_am_c = pid_m * BLOCK_SIZE_M
-        offs_bn_c = pid_n * BLOCK_SIZE_N
-
-        if TMA_STORE:
-            # Epilogue subtiling is a technique to break our computation and stores
-            # into multiple pieces. By subtiling we can reduce shared memory consumption
-            # by the epilogue and instead use that memory to increase our stage count.
-            if EPILOGUE_SUBTILE == 1:
-                accumulator = accumulator.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c], accumulator)
-            elif EPILOGUE_SUBTILE == 2:
-                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-                acc = tl.permute(acc, (0, 2, 1))
-                acc0, acc1 = tl.split(acc)
-                c0 = acc0.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c], c0)
-                c1 = acc1.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-            elif EPILOGUE_SUBTILE == 4:
-                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-                acc = tl.permute(acc, (0, 2, 1))
-                acc_lo, acc_hi = tl.split(acc)
-                acc_lo = tl.reshape(acc_lo, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
-                acc_lo = tl.permute(acc_lo, (0, 2, 1))
-                acc0, acc1 = tl.split(acc_lo)
-                acc_hi = tl.reshape(acc_hi, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
-                acc_hi = tl.permute(acc_hi, (0, 2, 1))
-                acc2, acc3 = tl.split(acc_hi)
-                c0 = acc0.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c], c0)
-                c1 = acc1.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 4], c1)
-                c2 = acc2.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c + 2 * BLOCK_SIZE_N // 4], c2)
-                c3 = acc3.to(dtype)
-                c_desc_or_ptr.store([offs_am_c, offs_bn_c + 3 * BLOCK_SIZE_N // 4], c3)
-            else:
-                tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
-        else:
-            accumulator = accumulator.to(dtype)
-            offs_cm = offs_am_c + tl.arange(0, BLOCK_SIZE_M)
-            offs_cn = offs_bn_c + tl.arange(0, BLOCK_SIZE_N)
-            c_ptrs = (
-                c_desc_or_ptr
-                + stride_cm * offs_cm[:, None]
-                + stride_cn * offs_cn[None, :]
+    if USE_META_WS:
+        for tile_id in tl.range(
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=FLATTEN,
+            warp_specialize=WARP_SPECIALIZE,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=1,
+        ):
+            tile_id_c = _matmul_tma_persistent_loop_body(
+                tile_id,
+                tile_id_c,
+                a_desc,
+                b_desc,
+                c_desc_or_ptr,
+                M,
+                N,
+                K,
+                stride_cm,
+                stride_cn,
+                num_pid_in_group,
+                num_pid_m,
+                k_tiles,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GROUP_SIZE_M,
+                EPILOGUE_SUBTILE,
+                NUM_SMS,
+                DTYPE,
+                TRANSPOSE_A,
+                TRANSPOSE_B,
+                TMA_STORE,
             )
-            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-            tl.store(c_ptrs, accumulator, mask=c_mask)
+    else:
+        for tile_id in tl.range(
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=FLATTEN,
+            warp_specialize=WARP_SPECIALIZE,
+        ):
+            tile_id_c = _matmul_tma_persistent_loop_body(
+                tile_id,
+                tile_id_c,
+                a_desc,
+                b_desc,
+                c_desc_or_ptr,
+                M,
+                N,
+                K,
+                stride_cm,
+                stride_cn,
+                num_pid_in_group,
+                num_pid_m,
+                k_tiles,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GROUP_SIZE_M,
+                EPILOGUE_SUBTILE,
+                NUM_SMS,
+                DTYPE,
+                TRANSPOSE_A,
+                TRANSPOSE_B,
+                TMA_STORE,
+            )
 
 
 def blackwell_matmul_tma_persistent(
@@ -592,6 +676,7 @@ def blackwell_matmul_tma_persistent(
         TRANSPOSE_A=transpose_a,
         TRANSPOSE_B=transpose_b,
         TMA_STORE=tma_store,
+        USE_META_WS=_use_meta_ws(),
     )
     return c
 
