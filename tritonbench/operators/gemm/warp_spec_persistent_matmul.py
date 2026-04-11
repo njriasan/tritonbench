@@ -1,6 +1,6 @@
 """
-This is copied from Triton matmul tutorial 9 and reduced to just the persistent matmul kernel
-on blackwell with/without warpspec.
+This is copied from Triton matmul tutorial 9 and reduced to just the
+persistent matmul kernel on blackwell with/without warpspec.
 """
 
 import os
