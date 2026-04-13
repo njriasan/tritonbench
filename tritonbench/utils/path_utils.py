@@ -1,10 +1,12 @@
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional, Union
 
 REPO_PATH = Path(os.path.abspath(__file__)).parent.parent.parent
 SUBMODULE_PATH = REPO_PATH.joinpath("submodules")
+BUILD_PATH = REPO_PATH.joinpath("build")
 
 
 class add_path:
@@ -35,6 +37,24 @@ class add_ld_library_path:
 
     def __exit__(self, exc_type, exc_value, traceback):
         os.environ = self.os_environ.copy()
+
+
+@contextmanager
+def ensure_build_subdir_on_sys_path(subdir: str = ""):
+    path = BUILD_PATH.joinpath(subdir)
+    path_str = str(path)
+    added = False
+    if path.exists() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
+        added = True
+    try:
+        yield path_str
+    finally:
+        if added:
+            try:
+                sys.path.remove(path_str)
+            except ValueError:
+                pass
 
 
 def _find_param_loc(params, key: str) -> int:
