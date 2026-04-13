@@ -1,110 +1,202 @@
-# Original source: https://github.com/tile-ai/tilelang/blob/main/examples/gemm_sm100/gemm_tcgen5mma.py
 import tilelang
 import tilelang.language as T
 import torch
+from tilelang.carver.arch import driver
 
 tilelang.disable_cache()
 
+TILELANG_DTYPE_MAP = {
+    torch.bfloat16: T.bfloat16,
+    torch.float16: T.float16,
+}
 
-def matmul(
-    M,
-    N,
-    K,
+
+@tilelang.jit
+def gemm_persistent_2cta(
+    A,
+    B,
     block_M,
     block_N,
+    store_block_N,
     block_K,
-    trans_A,
-    trans_B,
     in_dtype,
     out_dtype,
     accum_dtype,
     num_stages,
-    threads,
+    use_tma_store=True,
 ):
-    A_shape = (K, M) if trans_A else (M, K)
-    B_shape = (N, K) if trans_B else (K, N)
-    A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
-    B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
+    M, N, K = T.const("M, N, K")
 
-    @T.prim_func
-    def main(
-        A: T.Tensor(A_shape, in_dtype),
-        B: T.Tensor(B_shape, in_dtype),
-        C: T.Tensor((M, N), out_dtype),
-    ):
-        with T.Kernel(
-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
-        ) as (bx, by):
-            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
-            B_shared = T.alloc_shared(B_shared_shape, in_dtype)
-            C_tmem = T.alloc_tmem([block_M, block_N], accum_dtype)
-            mbar = T.alloc_barrier(1)
-            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-            C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+    A: T.Tensor[[M, K], in_dtype]
+    B: T.Tensor[[K, N], in_dtype]
+    C = T.empty((M, N), out_dtype)
 
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[bx * block_N, k * block_K], B_shared)
-                T.gemm(
-                    A_shared,
-                    B_shared,
-                    C_tmem,
-                    trans_A,
-                    trans_B,
-                    mbar=mbar,
-                    wg_wait=-1,
-                    clear_accum=k == 0,
-                )
-                T.mbarrier_wait_parity(mbar, k % 2)
+    sm_num = driver.get_num_sms()
+    num_clusters = sm_num // 2
+    m_blocks = T.ceildiv(M, block_M)
+    m_clusters = m_blocks // 2
+    n_blocks = T.ceildiv(N, block_N)
+    assert K % (2 * block_K) == 0
+    k_blocks = T.ceildiv(K, block_K)
+    waves = T.ceildiv(m_blocks * n_blocks, sm_num)
+    group_size = 8
+    assert n_blocks % (2 * group_size) == 0
 
-            T.copy(C_tmem, C_local)
-            T.copy(C_local, C_shared)
+    with T.Kernel(sm_num, threads=256, cluster_dims=2) as (block_id):
+        A_shared = T.alloc_shared((num_stages, block_M, block_K), in_dtype)
+        B_shared = T.alloc_shared((num_stages, block_K, block_N // 2), in_dtype)
+        C_tmem_0 = T.alloc_tmem([block_M, block_N], accum_dtype)
+        C_tmem_1 = T.alloc_tmem([block_M, block_N], accum_dtype)
+        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+        C_local_cast = T.alloc_fragment((block_M, block_N), out_dtype)
+        C_shared = T.alloc_shared((block_M, store_block_N), out_dtype)
+        loaded = T.alloc_cluster_barrier([32 * 2] * num_stages)
+        consumed = T.alloc_cluster_barrier([1] * num_stages)
+        tmem_full = T.alloc_cluster_barrier([1] * 2)
+        tmem_empty = T.alloc_cluster_barrier([128 * 2] * 2)
 
-            T.copy(C_shared, C[by * block_M, bx * block_N])
+        tx = T.get_thread_binding()
+        cta_id = T.block_rank_in_cluster()
+        T.assume(cta_id < 2)
 
-    return main
+        if tx < 32:
+            for w in T.unroll(waves):
+                cluster_id = block_id // 2
+                tile_id = num_clusters * w + cluster_id
+                bx_cluster = (tile_id // group_size) % m_clusters
+                bx = bx_cluster * 2 + cta_id
+                by = (tile_id % group_size) + (
+                    tile_id // group_size
+                ) // m_clusters * group_size
 
+                if bx * block_M < M and by * block_N < N:
+                    for k in T.serial(k_blocks):
+                        phase = w * k_blocks + k
+                        T.mbarrier_wait_parity(
+                            consumed[phase % num_stages],
+                            ((phase // num_stages) & 1) ^ 1,
+                        )
+                        T.tma_copy(
+                            A[
+                                bx * block_M : (bx + 1) * block_M,
+                                k * block_K : (k + 1) * block_K,
+                            ],
+                            A_shared[phase % num_stages, :, :],
+                            barrier=loaded[phase % num_stages],
+                        )
+                        T.tma_copy(
+                            B[
+                                k * block_K : (k + 1) * block_K,
+                                (by * 2 + cta_id) * block_N // 2 : (by * 2 + cta_id + 1)
+                                * block_N
+                                // 2,
+                            ],
+                            B_shared[phase % num_stages, :, :],
+                            barrier=loaded[phase % num_stages],
+                        )
+                        T.mbarrier_arrive(loaded[phase % num_stages], 0)
 
-TILELANG_DTYPE_MAP = {
-    torch.bfloat16: "bfloat16",
-    torch.float16: "float16",
-    torch.float32: "float",
-}
+        elif tx < 64 and cta_id == 0:
+            for w in T.unroll(waves):
+                cluster_id = block_id // 2
+                tile_id = num_clusters * w + cluster_id
+                bx_cluster = (tile_id // group_size) % m_clusters
+                bx = bx_cluster * 2 + cta_id
+                by = (tile_id % group_size) + (
+                    tile_id // group_size
+                ) // m_clusters * group_size
+
+                if bx * block_M < M and by * block_N < N:
+                    T.mbarrier_wait_parity(tmem_empty[w & 1], ((w // 2) & 1) ^ 1)
+                    T.tcgen05_after_thread_sync()
+                    for k in T.serial(k_blocks):
+                        phase = w * k_blocks + k
+                        T.mbarrier_wait_parity(
+                            loaded[phase % num_stages], (phase // num_stages) & 1
+                        )
+                        T.tcgen05_after_thread_sync()
+                        if w & 1 == 0:
+                            T.tcgen05_gemm(
+                                A_shared[phase % num_stages, :, :],
+                                B_shared[phase % num_stages, :, :],
+                                C_tmem_0,
+                                mbar=consumed[phase % num_stages],
+                                clear_accum=k == 0,
+                                use_2cta=True,
+                            )
+                        else:
+                            T.tcgen05_gemm(
+                                A_shared[phase % num_stages, :, :],
+                                B_shared[phase % num_stages, :, :],
+                                C_tmem_1,
+                                mbar=consumed[phase % num_stages],
+                                clear_accum=k == 0,
+                                use_2cta=True,
+                            )
+                    T.tcgen05_mma_arrive(tmem_full[w & 1], arrive_2cta=True)
+
+        elif 128 <= tx < 256:
+            for w in T.unroll(waves):
+                cluster_id = block_id // 2
+                tile_id = num_clusters * w + cluster_id
+                bx_cluster = (tile_id // group_size) % m_clusters
+                bx = bx_cluster * 2 + cta_id
+                by = (tile_id % group_size) + (
+                    tile_id // group_size
+                ) // m_clusters * group_size
+
+                if bx * block_M < M and by * block_N < N:
+                    T.mbarrier_wait_parity(tmem_full[w & 1], (w // 2) & 1)
+                    T.tcgen05_after_thread_sync()
+                    T.sync_threads(1, 128)
+                    if (w & 1) == 0:
+                        T.copy(C_tmem_0, C_local)
+                    else:
+                        T.copy(C_tmem_1, C_local)
+                    T.tcgen05_before_thread_sync()
+                    T.mbarrier_arrive(tmem_empty[w & 1], 0)
+
+                    if use_tma_store:
+                        for i in T.unroll(T.ceildiv(block_N, store_block_N)):
+                            T.copy(
+                                C_local[:, i * store_block_N : (i + 1) * store_block_N],
+                                C_shared,
+                            )
+                            T.copy(
+                                C_shared,
+                                C[bx * block_M, by * block_N + i * store_block_N],
+                            )
+                    else:
+                        T.copy(C_local, C_local_cast)
+                        T.copy(C_local_cast, C[bx * block_M, by * block_N])
+
+    return C
 
 
 def tilelang_matmul_func(a, b):
-    M, K = a.size()
-    K, N = b.size()
-    b_T = b.T.contiguous()
-    block_M, block_N, block_K = 128, 256, 128
-    trans_A, trans_B = False, True
-    in_dtype = TILELANG_DTYPE_MAP[a.dtype]
-    out_dtype = TILELANG_DTYPE_MAP[a.dtype]
-    accum_dtype = "float"
-    num_stages = 2
-    threads = 256
-    func = matmul(
-        M,
-        N,
-        K,
+    if a.dtype not in TILELANG_DTYPE_MAP:
+        raise NotImplementedError("TileLang Blackwell matmul only supports fp16/bf16")
+    if a.dtype != b.dtype:
+        raise NotImplementedError("TileLang Blackwell matmul requires matching dtypes")
+    if a.dim() != 2 or b.dim() != 2:
+        raise NotImplementedError("TileLang Blackwell matmul only supports 2D inputs")
+
+    a = a.contiguous()
+    b = b.contiguous()
+
+    block_M, block_N, store_block_N, block_K = 128, 256, 64, 64
+    num_stages = 6
+
+    return lambda: gemm_persistent_2cta(
+        a,
+        b,
         block_M,
         block_N,
+        store_block_N,
         block_K,
-        trans_A,
-        trans_B,
-        in_dtype,
-        out_dtype,
-        accum_dtype,
+        TILELANG_DTYPE_MAP[a.dtype],
+        TILELANG_DTYPE_MAP[a.dtype],
+        T.float,
         num_stages,
-        threads,
+        True,
     )
-    jit_kernel = tilelang.compile(
-        func,
-        out_idx=[2],
-        target="cuda",
-        pass_configs={
-            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        },
-    )
-    return lambda: jit_kernel(a, b_T)
