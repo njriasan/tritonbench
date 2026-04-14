@@ -2150,6 +2150,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     fn=fn,
                     grad_to_none=self.get_grad_to_none(self.example_inputs),
                     range_name=_RANGE_NAME,
+                    # test_run=True calls fn() once before the NVTX range so
+                    # that @triton.autotune completes outside the profiled
+                    # region. NCU then only captures the winning config.
+                    test_run=True,
                 )
                 metrics.extra_metrics["single_run_in_task"] = "success"
             if self.tb_args.export:
