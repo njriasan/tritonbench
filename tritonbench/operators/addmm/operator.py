@@ -6,7 +6,7 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import torch
 import torch._inductor.config as inductor_config
 import triton
-from tritonbench.utils.env_utils import get_logger, is_fbcode
+from tritonbench.utils.env_utils import get_logger, IS_BLACKWELL, is_fbcode
 from tritonbench.utils.python_utils import try_import
 
 with try_import("HAS_HSTU"):
@@ -16,6 +16,8 @@ with try_import("HAS_HSTU"):
         )
     except ModuleNotFoundError:
         from .hstu import triton_addmm as hstu_triton_addmm
+
+    from .hstu import triton_addmm_fwd_b200_direct
 
 with try_import("HAS_STREAMK"):
     from tritonbench.operators.gemm.stream_k import streamk_cuda_matmul
@@ -34,7 +36,6 @@ if is_fbcode():
     from tritonbench.utils.fb.addmm_prod import get_prod_shapes
 else:
     get_prod_shapes = lambda x: None
-
 
 # Shape encoding information: (M, K, N, BIAS_1D_Y)
 BUILDIN_SHAPES = [
@@ -135,6 +136,10 @@ class Operator(BenchmarkOperator):
     @register_benchmark(enabled=HAS_HSTU)  # type: ignore # noqa: F821
     def triton_addmm(self, a, mat1, mat2) -> Callable:
         return lambda: hstu_triton_addmm(a, mat1, mat2)
+
+    @register_benchmark(enabled=HAS_HSTU and IS_BLACKWELL)  # type: ignore # noqa: F821
+    def triton_b200_ws(self, a, mat1, mat2) -> Callable:
+        return lambda: triton_addmm_fwd_b200_direct(a, mat1, mat2)
 
     # FIXME: bwd has some problem, need to re-enable it
     @register_benchmark(enabled=False)
