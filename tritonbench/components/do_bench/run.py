@@ -14,6 +14,7 @@ from tritonbench.utils.cudagraph_utils import CudaGraphConfig
 from .common import summarize_statistics
 from .gpu_events import do_bench_events
 from .power import do_bench_power
+from .utils import estimate_cuda_runtime_ms, resolve_warmup_and_rep
 
 NS_TO_MS = 1e-6
 logger = logging.getLogger(__name__)
@@ -219,6 +220,7 @@ def _do_bench_cudagraph_with_cache_clear(
         end_event.record()
         torch.cuda.synchronize()
         estimate_ms = start_event.elapsed_time(end_event) / 5
+        _, rep = resolve_warmup_and_rep(None, rep, estimate_ms)
 
         n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
 
@@ -301,13 +303,11 @@ def _do_bench_profiler(
         else None
     )
 
-    # First, estimate the runtime to calculate iterations
-    estimate_ms = triton.testing.do_bench(
+    clear_cache_fn = cache.zero_ if not skip_cache_clearing else lambda *args: None
+    estimate_ms = estimate_cuda_runtime_ms(
         fn,
-        warmup=warmup,
-        rep=rep,
         grad_to_none=grad_to_none,
-        return_mode="mean",
+        clear_cache_fn=clear_cache_fn,
     )
 
     # Calculate number of iterations based on target rep time
@@ -315,8 +315,6 @@ def _do_bench_profiler(
         n_repeat = DEFAULT_N_REP  # Default if function is very fast
     else:
         n_repeat = max(1, int(rep / estimate_ms))
-
-    clear_cache_fn = cache.zero_ if not skip_cache_clearing else lambda *args: None
 
     # Helper function to execute one iteration
     def run_iteration():
@@ -432,7 +430,7 @@ def _do_bench_profiler(
 
 
 def _do_bench_cpu(
-    fn, warmup, rep=20, grad_to_none=None, quantiles=None, return_mode="mean"
+    fn, warmup, rep, grad_to_none=None, quantiles=None, return_mode="mean"
 ):
     """Measure latency of a function on CPU."""
     assert return_mode in ["min", "max", "mean", "median", "all"]
@@ -474,8 +472,8 @@ def _do_bench_cpu(
 
 def _do_bench_entropy(
     fn,
-    warmup=25,
-    rep=100,
+    warmup,
+    rep,
     grad_to_none=None,
     quantiles=None,
     return_mode="mean",
@@ -528,6 +526,7 @@ def _do_bench_entropy(
     precision_increase = False
 
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+    clear_cache_fn = lambda: triton.runtime.driver.active.clear_cache(cache)
 
     # Adaptive warmup loop with batched synchronization
     while True:
@@ -545,7 +544,7 @@ def _do_bench_entropy(
             if grad_to_none is not None:
                 for x in grad_to_none:
                     x.grad = None
-            triton.runtime.driver.active.clear_cache(cache)
+            clear_cache_fn()
             batch_start_events[i].record()
             fn()
             batch_end_events[i].record()
@@ -619,7 +618,7 @@ def _do_bench_entropy(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        triton.runtime.driver.active.clear_cache(cache)
+        clear_cache_fn()
         start_events[i].record()
         fn()
         end_events[i].record()
@@ -661,6 +660,14 @@ def do_bench_wrapper(
         entropy_window_size: Size of rolling window for entropy tracking
         entropy_max_samples: Maximum samples before stopping warmup (safety limit)
     """
+    if (warmup is None or rep is None) and not repcnt:
+        estimate_runtime = estimate_cuda_runtime_ms(fn, grad_to_none=grad_to_none)
+        warmup, rep = resolve_warmup_and_rep(
+            warmup,
+            rep,
+            estimate_runtime,
+        )
+
     try:
         if device == "cpu":
             return Latency(
