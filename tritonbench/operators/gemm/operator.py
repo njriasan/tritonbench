@@ -88,11 +88,7 @@ from tritonbench.utils.triton_op import (
 )
 
 try:
-    from tritonbench.operators.gemm.persistent_matmul import (
-        matmul_persistent,
-        matmul_tma_persistent,
-        matmul_tma_persistent_cached,
-    )
+    from tritonbench.operators.gemm.persistent_matmul import matmul_persistent
 
     HAS_PERSISTENT = True
 except ModuleNotFoundError:
@@ -341,25 +337,6 @@ class Operator(BenchmarkOperator):
             return lambda: matmul_persistent(a, b) + bias
         else:
             return lambda: matmul_persistent(a, b)
-
-    @register_benchmark(
-        enabled=not is_fbcode() and HAS_PERSISTENT and supports_tma(), fwd_only=True
-    )
-    def triton_tma_persistent_matmul(self, a, b, bias) -> Callable:
-        b = b.T.contiguous()
-        if bias is not None:
-            return lambda: matmul_tma_persistent(a, b) + bias
-        else:
-            return lambda: matmul_tma_persistent(a, b)
-
-    # TODO fix cached TMA backend
-    @register_benchmark(enabled=False, fwd_only=True)
-    def triton_tma_persistent_cached_matmul(self, a, b, bias) -> Callable:
-        b = b.T.contiguous()
-        if bias is not None:
-            return lambda: matmul_tma_persistent_cached(a, b) + bias
-        else:
-            return lambda: matmul_tma_persistent_cached(a, b)
 
     @register_benchmark(enabled=is_cuda())
     def triton_ops_matmul(self, a, b, bias) -> Callable:
@@ -675,8 +652,8 @@ class Operator(BenchmarkOperator):
         else:
             return lambda: _tlx_matmul_2cta(a_contig, b_contig).to(target_dtype)
 
-    @register_benchmark(enabled=IS_BLACKWELL)
-    def triton_blackwell_warpspec_persistent_matmul(self, a, b, bias) -> Callable:
+    @register_benchmark(enabled=IS_BLACKWELL or IS_HOPPER)
+    def triton_warpspec_tma_persistent_matmul(self, a, b, bias) -> Callable:
         if bias is not None:
             return (
                 lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=True)
@@ -685,8 +662,8 @@ class Operator(BenchmarkOperator):
         else:
             return lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=True)
 
-    @register_benchmark(enabled=IS_BLACKWELL)
-    def triton_blackwell_persistent_matmul(self, a, b, bias) -> Callable:
+    @register_benchmark(enabled=IS_BLACKWELL or IS_HOPPER)
+    def triton_tma_persistent_matmul(self, a, b, bias) -> Callable:
         if bias is not None:
             return (
                 lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=False)
@@ -695,22 +672,22 @@ class Operator(BenchmarkOperator):
         else:
             return lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=False)
 
-    @register_benchmark(enabled=IS_BLACKWELL)
-    def triton_blackwell_warpspec_tma_matmul(self, a, b, bias) -> Callable:
+    @register_benchmark(enabled=IS_BLACKWELL or IS_HOPPER)
+    def triton_warpspec_tma_matmul(self, a, b, bias) -> Callable:
         if bias is not None:
             return lambda: blackwell_matmul_tma(a, b, warp_specialize=True) + bias
         else:
             return lambda: blackwell_matmul_tma(a, b, warp_specialize=True)
 
-    @register_benchmark(enabled=IS_BLACKWELL)
-    def triton_blackwell_tma_matmul(self, a, b, bias) -> Callable:
+    @register_benchmark(enabled=IS_BLACKWELL or IS_HOPPER)
+    def triton_tma_matmul(self, a, b, bias) -> Callable:
         if bias is not None:
             return lambda: blackwell_matmul_tma(a, b, warp_specialize=False) + bias
         else:
             return lambda: blackwell_matmul_tma(a, b, warp_specialize=False)
 
-    @register_benchmark(enabled=IS_BLACKWELL)
-    def triton_blackwell_warpspec_descriptor_matmul(self, a, b, bias) -> Callable:
+    @register_benchmark(enabled=IS_BLACKWELL or IS_HOPPER)
+    def triton_warpspec_descriptor_persistent_matmul(self, a, b, bias) -> Callable:
         if bias is not None:
             return (
                 lambda: blackwell_matmul_descriptor_persistent(
@@ -723,8 +700,8 @@ class Operator(BenchmarkOperator):
                 a, b, warp_specialize=True
             )
 
-    @register_benchmark(enabled=IS_BLACKWELL)
-    def triton_blackwell_descriptor_matmul(self, a, b, bias) -> Callable:
+    @register_benchmark(enabled=IS_BLACKWELL or IS_HOPPER)
+    def triton_descriptor_persistent_matmul(self, a, b, bias) -> Callable:
         if bias is not None:
             return (
                 lambda: blackwell_matmul_descriptor_persistent(

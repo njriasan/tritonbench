@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
-from tritonbench.utils.env_utils import is_tile_enabled
+from tritonbench.utils.env_utils import IS_BLACKWELL, IS_HOPPER, is_tile_enabled
 
 from .triton_matmul_configs import get_tileir_configs
 
@@ -63,7 +63,9 @@ if include_small_configs:
     default_s_range = small_stage_range
     tma_persistent_s_range = small_stage_range
 else:
-    bm_range = [128, 256]
+    # Hopper has smaller WGMMA tiles and tighter register budgets than
+    # Blackwell, so BLOCK_M=256 is rarely useful; trim the M range there.
+    bm_range = [64, 128] if IS_HOPPER else [128, 256]
     bn_range = [128, 256]
     bk_range = [64, 128]
     default_s_range = [3, 4]
@@ -118,6 +120,16 @@ def _use_meta_ws():
         return triton.knobs.nvidia.use_meta_ws
     except AttributeError:
         return False
+
+
+def _pingpong_options():
+    """``pingpongAutoWS`` is a triton.Config autotune kwarg in the beta
+    branch (see test_tutorial09_warp_specialization.py for canonical
+    usage). It schedules producer/consumer warps in a ping-pong pattern
+    and is only useful on Hopper with the meta WS pipeline."""
+    if IS_HOPPER and _use_meta_ws():
+        return [True, False]
+    return [None]
 
 
 def _prune_warp_specialize_configs(configs, named_args, **kwargs):
@@ -320,12 +332,21 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                     )
         return configs
     else:
-        extra_kwargs = {}
+        early_tma_store_lowering = [1] if _use_meta_ws() else [None]
         if _use_meta_ws():
-            extra_kwargs["early_tma_store_lowering"] = 1
-            extra_kwargs["maxRegAutoWS"] = 255
-        return [
-            triton.Config(
+            maxReg = [252] if IS_BLACKWELL else [208, 252]
+        else:
+            maxReg = [None]
+
+        def _make_config(BM, BN, BK, s, w, SUBTILE, FLATTEN, DP, pp, store_lowering, maxReg):
+            extras = {}
+            if pp is not None:
+                extras["pingpongAutoWS"] = pp
+            if store_lowering is not None:
+                extras["early_tma_store_lowering"] = store_lowering
+            if maxReg is not None:
+                extras["maxRegAutoWS"] = maxReg
+            return triton.Config(
                 {
                     "BLOCK_SIZE_M": BM,
                     "BLOCK_SIZE_N": BN,
@@ -338,8 +359,11 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                 num_stages=s,
                 num_warps=w,
                 pre_hook=pre_hook,
-                **extra_kwargs,
-            )  #
+                **extras,
+            )
+
+        return [
+            _make_config(BM, BN, BK, s, w, SUBTILE, FLATTEN, DP, pp, sl, mr)
             for BM in bm_range  #
             for BN in bn_range  #
             for BK in bk_range  #
@@ -348,38 +372,54 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
             for SUBTILE in [1, 2, 4]  #
             for FLATTEN in [True, False]  #
             for DP in [1, 2]  #
+            for pp in _pingpong_options()  #
+            for sl in early_tma_store_lowering  #
+            for mr in maxReg  #
         ]
 
 
 def _prune_tma_persistent_configs(configs, named_args, **kwargs):
-    """Prune configs for the TMA persistent kernel based on FLATTEN/WS rules.
+    """Prune configs for the TMA persistent kernel.
 
-    - WARP_SPECIALIZE=False: require FLATTEN=False
-    - WARP_SPECIALIZE=True + meta WS: require FLATTEN=False
-    - WARP_SPECIALIZE=True + no meta WS: require FLATTEN=True
+    FLATTEN rules. FLATTEN=True is only supported on Blackwell with the
+    OAI Triton WS path.
+    - Hopper: require FLATTEN=False (regardless of WS / meta WS)
+    - Blackwell + WARP_SPECIALIZE=False: require FLATTEN=False
+    - Blackwell + WARP_SPECIALIZE=True + meta WS: require FLATTEN=False
+    - Blackwell + WARP_SPECIALIZE=True + OAI Triton WS: require FLATTEN=True
+
+    DATA_PARTITION_FACTOR rules. DP=2 is only valid on the meta WS path,
+    and the partitioned M tile must match the arch's largest usable
+    BLOCK_M (128 on Hopper, 256 on Blackwell).
     """
     ws = kwargs.get("WARP_SPECIALIZE", False)
+    flatten_required = ws and not _use_meta_ws() and not IS_HOPPER
     kept = []
     for c in configs:
         subtile = c.kwargs.get("EPILOGUE_SUBTILE", 1)
+        if IS_HOPPER and subtile != 1:
+            continue
         if c.kwargs.get("BLOCK_SIZE_N", 1) % subtile != 0:
             continue
         flatten = c.kwargs.get("FLATTEN", False)
-        if not ws:
-            if flatten:
-                continue
-        elif _use_meta_ws():
-            if flatten:
-                continue
-        else:
-            if not flatten:
-                continue
+        if flatten != flatten_required:
+            continue
         data_partition_factor = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
         if data_partition_factor != 1:
             if not _use_meta_ws():
                 continue
             block_m = c.kwargs.get("BLOCK_SIZE_M", 1)
-            if block_m != 256:
+            # Data partitioning needs the largest M tile that still fits in
+            # registers: BLOCK_M=128 on Hopper, BLOCK_M=256 on Blackwell.
+            required_block_m = 128 if IS_HOPPER else 256
+            if block_m != required_block_m:
+                continue
+        # Select optimal register value for Hopper.
+        if IS_HOPPER and ws and _use_meta_ws():
+            maxReg = getattr(c, "maxRegAutoWS", 208)
+            if maxReg == 208 and data_partition_factor == 1:
+                continue
+            elif maxReg == 252 and data_partition_factor == 2:
                 continue
         kept.append(c)
     return _prune_warp_specialize_configs(kept, named_args, **kwargs)
@@ -827,6 +867,327 @@ def matmul_kernel_descriptor_persistent(
             c_desc.store([offs_cm, offs_cn + 3 * BLOCK_SIZE_N // 4], c3)
         else:
             tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
+
+
+# ============================================================================
+# Split-K Persistent Matmul with Warp Specialization
+#
+# Decomposes the K dimension across SPLIT_K groups of CTAs, each computing
+# a partial sum into a (SPLIT_K * M, N) workspace. A separate reduce kernel
+# folds the partial sums into the final output in fp32. This is beneficial
+# for undersaturated GEMMs where M*N tiles do not fill all SMs but K is
+# large enough to split.
+# ============================================================================
+
+
+def splitk_set_block_size_hook(nargs):
+    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 1)
+    BLOCK_M = nargs["BLOCK_SIZE_M"]
+    BLOCK_N = nargs["BLOCK_SIZE_N"]
+    BLOCK_K = nargs["BLOCK_SIZE_K"]
+    if nargs["TRANSPOSE_A"]:
+        nargs["a_desc"].block_shape = [BLOCK_K, BLOCK_M]
+    else:
+        nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
+    if nargs["TRANSPOSE_B"]:
+        nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
+    else:
+        nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N]
+    nargs["ws_desc"].block_shape = [BLOCK_M, BLOCK_N // EPILOGUE_SUBTILE]
+
+
+def matmul_splitk_get_configs(pre_hook=None):
+    base_extra = {}
+    if _use_meta_ws():
+        base_extra["early_tma_store_lowering"] = 1
+        if IS_BLACKWELL:
+            base_extra["maxRegAutoWS"] = 255
+
+    splitk_bm_range = [64, 128] if IS_HOPPER else [128]
+
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": BM,
+                "BLOCK_SIZE_N": BN,
+                "BLOCK_SIZE_K": BK,
+                "GROUP_SIZE_M": 8,
+                "EPILOGUE_SUBTILE": SUBTILE,
+                "FLATTEN": False,
+            },
+            num_stages=s,
+            num_warps=4,
+            pre_hook=pre_hook,
+            **base_extra,
+        )
+        for BM in splitk_bm_range
+        for BN in [128, 256]
+        for BK in [64, 128]
+        for s in [2, 3]
+        for SUBTILE in [1, 2, 4]
+        if BN % SUBTILE == 0
+    ]
+
+
+@triton.autotune(
+    configs=matmul_splitk_get_configs(pre_hook=splitk_set_block_size_hook),
+    key=["M", "N", "K", "SPLIT_K"],
+    prune_configs_by={"early_config_prune": _prune_warp_specialize_configs},
+)
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def matmul_kernel_tma_persistent_splitk(
+    a_desc,
+    b_desc,
+    ws_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    FLATTEN: tl.constexpr,
+    DTYPE: tl.constexpr,
+    TRANSPOSE_A: tl.constexpr,
+    TRANSPOSE_B: tl.constexpr,
+    USE_META_WS: tl.constexpr,
+):
+    dtype = DTYPE
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_mn_tiles = num_pid_m * num_pid_n
+    num_tiles = num_mn_tiles * SPLIT_K
+    k_per_split = tl.cdiv(k_tiles, SPLIT_K)
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    if USE_META_WS:
+        loop_iter = tl.range(
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=FLATTEN,
+            warp_specialize=True,
+            disallow_acc_multi_buffer=True,
+        )
+    else:
+        loop_iter = tl.range(
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=FLATTEN,
+            warp_specialize=True,
+        )
+
+    for tile_id in loop_iter:
+        split_id = tile_id // num_mn_tiles
+        mn_tile_id = tile_id % num_mn_tiles
+        k_start = split_id * k_per_split
+        k_end = tl.minimum(k_start + k_per_split, k_tiles)
+
+        pid_m, pid_n = _compute_pid(
+            mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_start, k_end):
+            offs_k = ki * BLOCK_SIZE_K
+            if TRANSPOSE_A:
+                a = a_desc.load([offs_k, offs_am])
+                arg1 = a.T
+            else:
+                a = a_desc.load([offs_am, offs_k])
+                arg1 = a
+            if TRANSPOSE_B:
+                b = b_desc.load([offs_bn, offs_k])
+                arg2 = b.T
+            else:
+                b = b_desc.load([offs_k, offs_bn])
+                arg2 = b
+            accumulator = tl.dot(arg1, arg2, accumulator)
+
+        tile_id_c += NUM_SMS
+        split_id_c = tile_id_c // num_mn_tiles
+        mn_tile_id_c = tile_id_c % num_mn_tiles
+        pid_m, pid_n = _compute_pid(
+            mn_tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
+        row_base = split_id_c * M
+
+        if EPILOGUE_SUBTILE == 1:
+            c = accumulator.to(dtype)
+            ws_desc.store([row_base + offs_am_c, offs_bn_c], c)
+        elif EPILOGUE_SUBTILE == 2:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            c0 = acc0.to(dtype)
+            ws_desc.store([row_base + offs_am_c, offs_bn_c], c0)
+            c1 = acc1.to(dtype)
+            ws_desc.store(
+                [row_base + offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1
+            )
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc_lo, acc_hi = tl.split(acc)
+            acc_lo = tl.reshape(acc_lo, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+            acc_lo = tl.permute(acc_lo, (0, 2, 1))
+            acc0, acc1 = tl.split(acc_lo)
+            acc_hi = tl.reshape(acc_hi, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4))
+            acc_hi = tl.permute(acc_hi, (0, 2, 1))
+            acc2, acc3 = tl.split(acc_hi)
+            c0 = acc0.to(dtype)
+            ws_desc.store([row_base + offs_am_c, offs_bn_c], c0)
+            c1 = acc1.to(dtype)
+            ws_desc.store(
+                [row_base + offs_am_c, offs_bn_c + BLOCK_SIZE_N // 4], c1
+            )
+            c2 = acc2.to(dtype)
+            ws_desc.store(
+                [row_base + offs_am_c, offs_bn_c + 2 * BLOCK_SIZE_N // 4], c2
+            )
+            c3 = acc3.to(dtype)
+            ws_desc.store(
+                [row_base + offs_am_c, offs_bn_c + 3 * BLOCK_SIZE_N // 4], c3
+            )
+        else:
+            tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
+
+
+@triton.jit
+def _reduce_k_kernel(
+    workspace_ptr,
+    c_ptr,
+    M,
+    N,
+    SPLIT_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    base = offs_m[:, None] * N + offs_n[None, :]
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for s in range(SPLIT_K):
+        partial = tl.load(workspace_ptr + base + s * M * N, mask=mask, other=0.0)
+        acc += partial.to(tl.float32)
+    tl.store(c_ptr + base, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+def blackwell_matmul_tma_persistent_splitk(a, b, split_k=None):
+    """Persistent TMA matmul with warp specialization + Split-K.
+
+    Targets undersaturated GEMMs where M*N tiles do not fill all SMs but K
+    is large. Each of SPLIT_K groups computes a partial sum; a reduce kernel
+    folds them into the final output in fp32.
+    """
+    transpose_a = a.stride()[-1] != 1
+    if a.shape[1] != b.shape[1]:
+        transpose_b = b.stride()[-1] != 1
+    else:
+        transpose_b = b.stride()[0] == 1 and b.stride()[-1] != 1
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+
+    M, K = a.shape
+    if a.shape[1] != b.shape[1]:
+        K, N = b.shape
+    else:
+        N, K = b.shape
+    dtype = a.dtype
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    if split_k is None:
+        mn_tiles = triton.cdiv(M, 128) * triton.cdiv(N, 128)
+        k_tiles = triton.cdiv(K, 64)
+        split_k = 1
+        for sk in [4, 2, 8]:
+            if k_tiles >= sk * 4 and mn_tiles * sk <= NUM_SMS * 2:
+                split_k = sk
+                break
+        if split_k == 1:
+            split_k = 2
+
+    k_tiles = triton.cdiv(K, 64)
+    k_per_split = triton.cdiv(k_tiles, split_k)
+    if k_per_split * (split_k - 1) >= k_tiles:
+        split_k = 2
+
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    workspace = torch.empty((split_k * M, N), device=a.device, dtype=dtype)
+
+    dummy_block = [1, 1]
+    a_strides = [a.stride()[1] if transpose_a else a.stride()[0], 1]
+    check_tma_alignment(a_strides, (torch.finfo(a.dtype).bits + 7) // 8)
+    if transpose_a:
+        a_desc = TensorDescriptor(a, [K, M], a_strides, dummy_block)
+    else:
+        a_desc = TensorDescriptor(a, [M, K], a_strides, dummy_block)
+    b_strides = [b.stride()[1] if b.stride()[0] == 1 else b.stride()[0], 1]
+    check_tma_alignment(b_strides, (torch.finfo(b.dtype).bits + 7) // 8)
+    if transpose_b:
+        b_desc = TensorDescriptor(b, [N, K], b_strides, dummy_block)
+    else:
+        b_desc = TensorDescriptor(b, [K, N], b_strides, dummy_block)
+    ws_desc = TensorDescriptor(
+        workspace, workspace.shape, workspace.stride(), dummy_block
+    )
+
+    def grid(META):
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"])
+                * split_k,
+            ),
+        )
+
+    matmul_kernel_tma_persistent_splitk[grid](
+        a_desc,
+        b_desc,
+        ws_desc,
+        M,
+        N,
+        K,
+        NUM_SMS=NUM_SMS,
+        SPLIT_K=split_k,
+        DTYPE=torch_dtype_to_triton_dtype(dtype),
+        TRANSPOSE_A=transpose_a,
+        TRANSPOSE_B=transpose_b,
+        USE_META_WS=_use_meta_ws(),
+    )
+
+    REDUCE_BM, REDUCE_BN = 32, 32
+    reduce_grid = (triton.cdiv(M, REDUCE_BM), triton.cdiv(N, REDUCE_BN))
+    _reduce_k_kernel[reduce_grid](
+        workspace,
+        c,
+        M,
+        N,
+        SPLIT_K=split_k,
+        BLOCK_SIZE_M=REDUCE_BM,
+        BLOCK_SIZE_N=REDUCE_BN,
+        OUTPUT_DTYPE=torch_dtype_to_triton_dtype(dtype),
+        num_warps=4,
+    )
+
+    return c
 
 
 def blackwell_matmul_descriptor_persistent(a, b, warp_specialize: bool):
