@@ -493,8 +493,6 @@ gemm:
     - triton
   triton_persistent_matmul:
     tags: []
-  triton_tma_persistent_cached_matmul:
-    tags: []
   triton_tma_persistent_matmul:
     tags: []
   triton_tutorial_matmul:
