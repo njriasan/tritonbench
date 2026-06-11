@@ -14,12 +14,13 @@ from tritonbench.operators.gemm.partition_k import (
 )
 from tritonbench.operators.gemm.stream_k import streamk_amd_matmul, streamk_cuda_matmul
 
-from tritonbench.operators.gemm.warp_spec_persistent_matmul import (
-    blackwell_matmul_descriptor_persistent,
-    blackwell_matmul_tma,
-    blackwell_matmul_tma_persistent,
-    blackwell_matmul_tma_persistent_splitk,
-)
+if False:
+    from tritonbench.operators.gemm.warp_spec_persistent_matmul import (
+        blackwell_matmul_descriptor_persistent,
+        blackwell_matmul_tma,
+        blackwell_matmul_tma_persistent,
+        blackwell_matmul_tma_persistent_splitk,
+    )
 from tritonbench.utils.triton_utils import has_tlx
 
 if has_tlx():
