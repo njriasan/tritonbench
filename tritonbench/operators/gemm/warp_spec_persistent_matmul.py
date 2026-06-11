@@ -318,6 +318,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                 for FLATTEN in [True, False]:
                     kwargs = {
                         "EPILOGUE_SUBTILE": SUBTILE,
+                        "TWO_CTAS": False,
                         **new_kwargs,
                     }
                     kwargs["FLATTEN"] = FLATTEN
@@ -333,9 +334,21 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
         return configs
     else:
         early_tma_store_lowering = [1] if _use_meta_ws() else [None]
+        two_cta_options = [False, True] if _use_meta_ws() and IS_BLACKWELL else [False]
 
         def _make_config(
-            BM, BN, BK, s, w, SUBTILE, FLATTEN, DP, pp, store_lowering, maxReg=None
+            BM,
+            BN,
+            BK,
+            s,
+            w,
+            SUBTILE,
+            FLATTEN,
+            DP,
+            pp,
+            store_lowering,
+            TWO_CTAS,
+            maxReg=None,
         ):
             extras = {}
             if pp is not None:
@@ -344,6 +357,8 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                 extras["early_tma_store_lowering"] = store_lowering
             if maxReg is not None:
                 extras["maxRegAutoWS"] = maxReg
+            if TWO_CTAS:
+                extras["ctas_per_cga"] = (2, 1, 1)
             return triton.Config(
                 {
                     "BLOCK_SIZE_M": BM,
@@ -353,6 +368,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
                     "EPILOGUE_SUBTILE": SUBTILE,
                     "FLATTEN": FLATTEN,
                     "DATA_PARTITION_FACTOR": DP,
+                    "TWO_CTAS": TWO_CTAS,
                 },
                 num_stages=s,
                 num_warps=w,
@@ -361,7 +377,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
             )
 
         return [
-            _make_config(BM, BN, BK, s, w, SUBTILE, FLATTEN, DP, pp, sl)
+            _make_config(BM, BN, BK, s, w, SUBTILE, FLATTEN, DP, pp, sl, TWO_CTAS)
             for BM in bm_range  #
             for BN in bn_range  #
             for BK in bk_range  #
@@ -372,6 +388,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
             for DP in [1, 2]  #
             for pp in _pingpong_options()  #
             for sl in early_tma_store_lowering  #
+            for TWO_CTAS in two_cta_options  #
         ]
 
 
@@ -402,6 +419,21 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
         if flatten != flatten_required:
             continue
         data_partition_factor = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
+        two_ctas = c.kwargs.get("TWO_CTAS", False)
+        if two_ctas:
+            if not (_use_meta_ws() and IS_BLACKWELL and ws):
+                continue
+            if data_partition_factor != 1:
+                continue
+            block_m = c.kwargs.get("BLOCK_SIZE_M", 1)
+            block_n = c.kwargs.get("BLOCK_SIZE_N", 1)
+            group_size_m = c.kwargs.get("GROUP_SIZE_M", 1)
+            if block_m < 128:
+                continue
+            if group_size_m < 2 or group_size_m % 2 != 0:
+                continue
+            if block_n % 2 != 0 or block_n // 2 < 16:
+                continue
         if data_partition_factor != 1:
             if not _use_meta_ws():
                 continue
@@ -441,6 +473,7 @@ def _matmul_tma_persistent_loop_body(
     TRANSPOSE_B: tl.constexpr,
     TMA_STORE: tl.constexpr,
     RECOMPUTE_EPILOGUE_PID: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
 ):
     dtype = DTYPE
     pid_m, pid_n = _compute_pid(
@@ -464,7 +497,10 @@ def _matmul_tma_persistent_loop_body(
         else:
             b = b_desc.load([offs_k, offs_bn])
             arg2 = b
-        accumulator = tl.dot(arg1, arg2, accumulator)
+        if TWO_CTAS:
+            accumulator = tl.dot(arg1, arg2, accumulator, two_ctas=True)
+        else:
+            accumulator = tl.dot(arg1, arg2, accumulator)
 
     tile_id_c += NUM_SMS
     if RECOMPUTE_EPILOGUE_PID:
@@ -552,11 +588,14 @@ def matmul_kernel_tma_persistent(
     TRANSPOSE_B: tl.constexpr,
     TMA_STORE: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,  #
+    TWO_CTAS: tl.constexpr,  #
     USE_META_WS: tl.constexpr,  #
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    if USE_META_WS and TWO_CTAS:
+        num_pid_m = (num_pid_m + 1) // 2 * 2
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
@@ -599,6 +638,7 @@ def matmul_kernel_tma_persistent(
                 TRANSPOSE_B,
                 TMA_STORE,
                 True,
+                TWO_CTAS,
             )
     else:
         for tile_id in tl.range(
@@ -632,6 +672,7 @@ def matmul_kernel_tma_persistent(
                 TRANSPOSE_A,
                 TRANSPOSE_B,
                 TMA_STORE,
+                False,
                 False,
             )
 
@@ -695,10 +736,13 @@ def blackwell_matmul_tma_persistent(
         nonlocal a_desc, b_desc, c_desc_or_ptr
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
+        num_pid_m = triton.cdiv(M, BLOCK_M)
+        if META.get("TWO_CTAS", False):
+            num_pid_m = triton.cdiv(num_pid_m, 2) * 2
         return (
             min(
                 NUM_SMS,
-                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+                num_pid_m * triton.cdiv(N, BLOCK_N),
             ),
         )
 
