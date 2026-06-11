@@ -440,6 +440,7 @@ def _matmul_tma_persistent_loop_body(
     TRANSPOSE_A: tl.constexpr,
     TRANSPOSE_B: tl.constexpr,
     TMA_STORE: tl.constexpr,
+    RECOMPUTE_EPILOGUE_PID: tl.constexpr,
 ):
     dtype = DTYPE
     pid_m, pid_n = _compute_pid(
@@ -466,11 +467,15 @@ def _matmul_tma_persistent_loop_body(
         accumulator = tl.dot(arg1, arg2, accumulator)
 
     tile_id_c += NUM_SMS
-    pid_m, pid_n = _compute_pid(
-        tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-    )
-    offs_am_c = pid_m * BLOCK_SIZE_M
-    offs_bn_c = pid_n * BLOCK_SIZE_N
+    if RECOMPUTE_EPILOGUE_PID:
+        pid_m, pid_n = _compute_pid(
+            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
+    else:
+        offs_am_c = offs_am
+        offs_bn_c = offs_bn
 
     if TMA_STORE:
         # Epilogue subtiling is a technique to break our computation and stores
@@ -593,6 +598,7 @@ def matmul_kernel_tma_persistent(
                 TRANSPOSE_A,
                 TRANSPOSE_B,
                 TMA_STORE,
+                True,
             )
     else:
         for tile_id in tl.range(
@@ -626,6 +632,7 @@ def matmul_kernel_tma_persistent(
                 TRANSPOSE_A,
                 TRANSPOSE_B,
                 TMA_STORE,
+                False,
             )
 
 
