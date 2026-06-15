@@ -423,8 +423,6 @@ def _prune_tma_persistent_configs(configs, named_args, **kwargs):
         if two_ctas:
             if not (_use_meta_ws() and IS_BLACKWELL and ws):
                 continue
-            if data_partition_factor != 1:
-                continue
             block_m = c.kwargs.get("BLOCK_SIZE_M", 1)
             block_n = c.kwargs.get("BLOCK_SIZE_N", 1)
             group_size_m = c.kwargs.get("GROUP_SIZE_M", 1)
